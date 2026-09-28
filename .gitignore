@@ -50,3 +50,6 @@ profiling_logs_*/
 _site/
 site/
 .site-theme/
+
+# Personal tutorial notes (separate repo: deciding/perfsim)
+perfsim/
