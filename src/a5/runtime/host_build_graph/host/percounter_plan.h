@@ -180,7 +180,14 @@ struct alignas(128) PercounterControl {
     uint64_t fanin_offset;
     uint64_t fanin_addr_offset;
     uint64_t counters_offset;
-    uint8_t reserved[128 - 10 * sizeof(uint64_t)];
+    // Written by the AICPU after the handshake, not by the host: the cluster
+    // count is discovered at bring-up. Two numbers are the whole of what a lane
+    // needs to place itself, because scheduler_cluster_coordinate_from_worker is
+    // a pure function of them plus the block index it already has. That is why
+    // percounter needs no per-worker context array and no scheduler election.
+    uint64_t cluster_count;
+    uint64_t aiv_per_cluster;
+    uint8_t reserved[128 - 12 * sizeof(uint64_t)];
 };
 static_assert(sizeof(PercounterControl) == 128, "percounter control is one 128 B line");
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);

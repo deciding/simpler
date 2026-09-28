@@ -18,13 +18,35 @@ inline bool aicore_scheduler_runtime_mode_is_resident(uint32_t mode) {
     return mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
 }
 
-inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
-    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE;
+inline bool aicore_scheduler_runtime_mode_is_percounter(uint32_t mode) {
+    return mode == SCHEDULER_RUNTIME_MODE_PERCOUNTER;
 }
 
+/** Every mode whose scheduling happens on the AICore rather than the AICPU. */
+inline bool aicore_scheduler_runtime_mode_is_device(uint32_t mode) {
+    return aicore_scheduler_runtime_mode_is_resident(mode) || aicore_scheduler_runtime_mode_is_percounter(mode);
+}
+
+inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
+    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE ||
+           mode == SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED;
+}
+
+// Still resident-only, deliberately. Widening this is what admits percounter to
+// the AICPU bring-up path, and that path has to learn to publish percounter's
+// topology first: as it stands it would find no context to hand over, spin in
+// wait_bootstrap_complete for a bootstrap_complete nobody sets, and end at the
+// scheduler timeout -- a hang on a shared card rather than an error. Until then
+// a percounter run falls through to the legacy branch below and is rejected
+// there, loudly and with the teardown legacy already owns.
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
            aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode);
+}
+
+inline bool aicore_scheduler_percounter_enabled(const Runtime *runtime) {
+    return runtime != nullptr && runtime->get_worker_count() > 0 &&
+           aicore_scheduler_runtime_mode_is_percounter(runtime->dev.scheduler_bootstrap.runtime_mode);
 }
 
 inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
@@ -54,11 +76,29 @@ inline bool aicore_legacy_run_completed_audited_path(const Runtime *runtime, int
 // Worker 0's context sits at the published base, so the bootstrap context is the
 // base itself. A zero base is "no resident scheduler state", the same verdict a
 // zero handshake task carried before.
+//
+// Resident only, and the test is `is_resident` rather than the wider
+// `runtime_enabled`: percounter publishes the same word, but it points at a
+// PercounterControl. Widening the mode predicate without narrowing this would
+// hand every caller a SchedulerWorkerContext* to something that is not one.
 inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runtime) {
-    if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
+    if (runtime == nullptr || runtime->get_worker_count() <= 0 ||
+        !aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode) ||
+        runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
         return nullptr;
     }
     return reinterpret_cast<SchedulerWorkerContext *>(runtime->dev.scheduler_bootstrap.worker_context_base);
+}
+
+/**
+ * Percounter's equivalent: the published base is its control block, which is
+ * the only thing a lane needs to find every other table.
+ */
+inline void *aicore_percounter_control(Runtime *runtime) {
+    if (!aicore_scheduler_percounter_enabled(runtime) || runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(runtime->dev.scheduler_bootstrap.worker_context_base);
 }
 
 /**

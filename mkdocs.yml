@@ -116,6 +116,7 @@ nav:
       - Scheduler: scheduler.md
       - Percounter scheduler (design): percounter-scheduler.md
       - Percounter P1 plan: percounter-p1-plan.md
+      - Percounter P2 plan: percounter-p2-plan.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md

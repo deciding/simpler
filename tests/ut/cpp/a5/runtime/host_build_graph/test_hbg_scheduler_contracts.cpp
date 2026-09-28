@@ -70,6 +70,31 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
+// A caller that asks for legacy publishes LEGACY_REQUESTED, and aicpu_execute
+// rejects any run that reaches legacy scheduling without an explicit fallback
+// mode. Leave this out of the predicate and SIMPLER_HBG_SCHEDULER=legacy fails
+// the run it was supposed to select -- and nothing in a result-only test would
+// say why.
+TEST(AicoreSchedulerState, TreatsARequestedLegacyRunAsAnExplicitFallback) {
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED));
+}
+
+// Percounter schedules on the AICore, but it is NOT resident: the two share the
+// bootstrap word and mean different things by it. `is_device` is the union, and
+// `runtime_enabled` must stay resident-only until the AICPU bring-up path can
+// publish percounter's topology.
+TEST(AicoreSchedulerState, SeparatesPercounterFromResident) {
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_percounter(SCHEDULER_RUNTIME_MODE_PERCOUNTER));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_PERCOUNTER));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_PERCOUNTER));
+
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_device(SCHEDULER_RUNTIME_MODE_PERCOUNTER));
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_device(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_device(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_device(SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED));
+}
+
 TEST(AicoreSchedulerState, ResidentV0AcceptsOnlySingleLaneSingleBlockTasks) {
     EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(2, 1, false));
