@@ -18,7 +18,7 @@ per lane (AIC and AIV alike):
   if k >= order_count[q]: steal from another q, else drain and wait for EXIT
   t = order[q][k]
   for a in fanin_addr[e.fanin_begin .. +fanin_count]:
-      spin until observe(a) >= 1                  # dcci + read; spin only, never sleep
+      spin until ld_dev(a) >= 1                   # ~98 cyc; spin only, never sleep
   materialize args into my DispatchPayload slot
   execute_task(payload)                           # skipped when INLINE or predicate FAIL
   atomicAdd(counter[t], 1)                        # publish completion
@@ -109,11 +109,11 @@ line:
 atomic RMW targets) deliberately share line 0, while `next_waiter` (published
 through the cache) is pinned to offset 64.
 
-The counter array contains counters only, written exclusively by `atomicAdd`.
-P0 measured what that buys: packing is **correct** but costs linearly in
-counters per line, and a plain load never observes a remote atomic at all. So
-the array is padded to one counter per line and the spin uses an explicit
-invalidate (or an atomic read — §4).
+The counter array contains counters only, written by `atomicAdd` and read by
+`__builtin_cce_ld_dev`. P0 measured what that buys: packing is **correct** but
+costs linearly in counters per line, and an ordinary load — even a volatile one
+— never observes a remote atomic. So the array is padded to one counter per line
+and the spin reads through `ld_dev` (§4).
 
 Publication order per task: `execute_task` ends in `OUT_OF_ORDER_STORE_BARRIER`
 (`dsb(DSB_DDR)`), then `atomicAdd(counter[t], 1)`. A consumer that observes the
@@ -152,38 +152,45 @@ So **each counter takes its own 64 B line**: 64 B per task, 640 KB for a 10k-tas
 graph, far inside the 64 MB L2. The compact `uint64 counter[task]` array this
 design first assumed is out; the padding is the only change and it is free.
 
-### A remote counter is only visible through an invalidate, and that is cheap
+### The fanin spin: `ld_dev` is both correct and cheapest
 
-95 cores spinning on one address that a 96th publishes once:
+95 cores spinning on one address that a 96th publishes once. Which idioms see
+the write at all:
 
-| read idiom | cyc/poll | observed it |
-| --- | --- | --- |
-| `GlobalTensor::GetValue` | 7.3 | 0 / 285 |
-| volatile `__gm__` deref | 248.7 | 0 / 285 |
-| `dcci(SINGLE_CACHE_LINE)` + `dsb` + deref | 1144 | **285 / 285** |
-| `AtomicAdd(ptr, 0)` | 16108 | 193 / 285 |
+| read idiom | what it does | cyc/poll | observed it |
+| --- | --- | --- | --- |
+| `GlobalTensor::GetValue` | hoisted out of the loop | 7.3 | 0 / 285 |
+| volatile `__gm__` deref | a real load, from a stale level | 248.7 | 0 / 285 |
+| `AtomicAdd(ptr, 0)` | full RMW at the atomic unit | 16109 | 239 / 285 |
+| `dcci(SINGLE_CACHE_LINE)` + `dsb` + deref | invalidate, drain, load | 1237 | **285 / 285** |
+| **`__builtin_cce_ld_dev`** | **device load, no RMW, no drain** | **1208** | **285 / 285** |
 
 The producer is confirmed to have published, so the two zeros are visibility
-failures, not a missing write. A plain load — even a volatile one doing a real
-249 cyc access — never observes a remote atomic. `scheduler_observe_cache_line`
-is load-bearing, not defensive.
+failures, not a missing write. Note the pair that matters: the volatile deref is
+**slower (249 cyc) and wrong**, `ld_dev` is **faster (98 cyc) and right**. It is
+not "a load with a keyword on it" — it reaches a coherent point, which is
+exactly why `scheduler_gm_query` is built on it.
 
-But 95 consumers on one address is the worst case, not the operating point:
+95 consumers is the worst case, not the operating point:
 
-| consumers on one producer | `dcci` cyc/poll | `AtomicAdd(ptr,0)` cyc/poll |
-| --- | --- | --- |
-| 2 | **327** | 339 |
-| 4 | **335** | 677 |
-| 8 | **336** | 1351 |
-| 95 | 1144 | 16108 |
+| consumers on one producer | `ld_dev` | `dcci` + deref | `AtomicAdd(ptr,0)` |
+| --- | --- | --- | --- |
+| 2 | **98** | 346 | 339 |
+| 4 | **123** | 346 | 678 |
+| 8 | **228** | 355 | 1351 |
+| 95 | 1208 | 1237 | 16109 |
 
-`dcci` is flat at ~330 cyc through fanout 8. The atomic read scales as
-`169 x consumers` — every poll is an RMW queueing at the atomic unit, where a
-read is not — so it is only competitive at fanout 2. It looks like the natural
-"atomic read" and it is a trap.
+- `ld_dev` wins by 2.5–3.5x through fanout 8; 98 cyc is about one L2 access
+  (`gm_lat` measures ~88 cyc), so a poll costs a read and nothing else.
+- `dcci` works but pays the `dsb` pipeline drain on every poll.
+- `AtomicAdd(ptr, 0)` scales as `169 x consumers` — the same `S x n` law as the
+  ticket below. **Adding zero does not skip the read-modify-write**, so every
+  poll queues at the atomic unit. Loads do not queue; RMWs do. It is the
+  obvious-looking "atomic read" and the wrong instrument.
 
-**A fanin check therefore costs ~330 cyc**, about one uncontended atomic. A
-lane left spinning on a producer is affordable.
+**A fanin check therefore costs ~100–230 cyc** — a quarter of one uncontended
+atomic. A lane left spinning on a producer is affordable, so v0 needs no
+lookahead window.
 
 ### The ticket is a congestion curve, and sharding flattens it
 
@@ -205,11 +212,28 @@ floor = crossover = S x ncores,  S = 169.2 cyc, constant over a 32x core range
 ```
 
 The floor *is* the crossover: below it the ticket sets the pace, above it the
-ticket costs **0.14 cyc**. No middle ground, no penalty on the free side.
+ticket costs **0.14 cyc**.
 
-> An earlier revision discarded the claim's return value. The atomic is posted,
-> so the claim pipelined and the floor read 3686 cyc — 4.4x optimistic.
-> Percounter cannot use that number.
+**Read the marginal cost, not the total.** The table is the total interval, and
+it includes the `work` the probe inserts, which makes the ticket look like a
+cliff. What the ticket actually costs is `L_core - work`, and it declines
+smoothly — at 96 cores: 16184 (work=0), 8175 (8000), **2182 (14000)**, ~0
+(17000). While saturated the total is pinned at the floor, so the marginal is
+`floor - work` by construction. Quoting the total as "the ticket costs 16.2 µs"
+is wrong at any work > 0, and an earlier revision of this doc did exactly that.
+
+That also reconciles this probe with `atomic_latency`'s sparse sweep, which
+looked like it disagreed by 4x. At the same per-core spacing (~14000 cyc) sparse
+reports `extra_shared = 3251` and this probe 2182 — the same quantity and the
+same order. The knees agree too: period ~40 (spacing ~17.5k) against a measured
+crossover between 14000 and 17000.
+
+> Two further caveats. An earlier revision discarded the claim's return value;
+> the atomic is posted, so the claim pipelined and the floor read 3686 cyc —
+> 4.4x optimistic. And this probe's pacing (`next += work` anchored at `t0`)
+> *maintains* synchronisation under saturation, so it measures the synchronised
+> arrival case, where sparse's free-running private chain measures the
+> desynchronised one. The gap is small here but the effect is unmeasured.
 
 Since the crossover scales linearly with the cores sharing one ticket, the
 number of tickets is the lever:
@@ -230,7 +254,7 @@ wrong.
 
 A lane that has claimed a task spins on its fanin and cannot run a different
 ready task meanwhile. Ascending task id is the only ordering v0 offers. The poll
-cost above settles how much this hurts: at ~330 cyc a check, a blocked lane is
+cost above settles how much this hurts: at ~100 cyc a check, a blocked lane is
 cheap to leave spinning, so v0 does not need a lookahead window.
 
 ## 5. Mode selection
@@ -280,7 +304,7 @@ percounter does not call it, so that check is not in the way.
 | Phase | Work | Verification |
 | --- | --- | --- |
 | **P0** | ~~stride sweep, fanin spin cost, ticket crossover~~ | **done** — `a5_test/ascendc/counter_deps/`, results in §4 |
-| **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `dcci` + read wins at ~330 cyc, ticket shards per cluster |
+| **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `ld_dev` wins at ~98 cyc, ticket shards per cluster |
 | **P1** | host: env parsing, constants, layout, table build | C++ unit tests under `tests/ut/cpp/a5/runtime/host_build_graph/`: env values incl. invalid, layout, fanin addresses, order partition, counter presets |
 | **P2** | AICPU predicate, AICore branch, `run_percounter_executor` | builds; a5sim |
 | **P3** | sim scene tests | `vector_example`, `single_core_dag`, `multi_core_dag`, `empty_lifecycle` across all three modes, plus a new wide/deep mixed AIC+AIV DAG and an assertion that percounter really ran |
