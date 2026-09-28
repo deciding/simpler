@@ -17,6 +17,12 @@ endmacro()
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
 
+# Percounter's host-side planning is header-only on purpose: create_scheduler_state,
+# which calls it, lives in runtime_maker.cpp's anonymous namespace and no test can
+# reach it.
+a5_hbg_case(test_hbg_percounter_tables.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
 a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)

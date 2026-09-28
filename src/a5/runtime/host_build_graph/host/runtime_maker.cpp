@@ -68,6 +68,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
+#include "percounter_plan.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_phase_trace.h"
@@ -1000,7 +1001,8 @@ void release_scheduler_state(Runtime *runtime) {
 
 void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     always_assert(
-        mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
+        mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE ||
+        mode == SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED
     );
     runtime->publish_scheduler_bootstrap(mode, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
@@ -1009,16 +1011,135 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     }
 }
 
+/**
+ * Build the percounter region, once the shape walk has established the graph is
+ * a v0 shape and classified every task.
+ *
+ * Walks the tasks a second time rather than threading two more outputs through
+ * the resident walk: the walk is O(tasks) over data already in cache, and the
+ * resident path is the one every current run takes.
+ */
+bool create_percounter_state(
+    Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
+    const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids
+) {
+    namespace pc = simpler::hbg::percounter;
+
+    std::vector<bool> inline_completed(static_cast<size_t>(total_tasks), false);
+    for (int64_t id : inline_completed_task_ids) {
+        inline_completed[static_cast<size_t>(id)] = true;
+    }
+
+    std::vector<pc::TaskInput> inputs(static_cast<size_t>(total_tasks));
+    uint64_t order_count[pc::PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
+    uint64_t edge_count = 0;
+    for (int64_t id = 0; id < total_tasks; ++id) {
+        ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(id);
+        const TaskPayload &payload = slot.to_payload();
+        pc::TaskInput &input = inputs[static_cast<size_t>(id)];
+        input.inline_completed = inline_completed[static_cast<size_t>(id)];
+        input.fanin_count = payload.fanin_count;
+        input.fanin_ids = payload.fanin_count > 0 ? payload.fanin_data() : nullptr;
+        edge_count += static_cast<uint64_t>(payload.fanin_count);
+
+        // An inline-completed task is in no order list, so its mask -- which is
+        // empty, and outside the v0 envelope -- is never consulted.
+        if (input.inline_completed) {
+            input.core_type_index = 0;
+            continue;
+        }
+        if (!pc::core_type_index_from_active_mask(
+                task_metadata[static_cast<size_t>(id)].active_mask, &input.core_type_index
+            )) {
+            LOG_ERROR(
+                "A5 HBG percounter: task id=%" PRId64 " has active mask 0x%x, which is not a v0 shape", id,
+                static_cast<unsigned>(task_metadata[static_cast<size_t>(id)].active_mask)
+            );
+            return false;
+        }
+        ++order_count[input.core_type_index];
+    }
+
+    pc::PercounterLayout layout{};
+    if (!pc::plan_layout(static_cast<uint64_t>(total_tasks), edge_count, order_count, &layout)) {
+        LOG_ERROR("A5 HBG percounter: state layout overflow");
+        return false;
+    }
+
+    void *device_state = nullptr;
+    void *host_base = nullptr;
+    if (api->acquire_scheduler_state_storage(
+            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_ALIGNMENT), &device_state,
+            &host_base
+        ) != 0 ||
+        device_state == nullptr || host_base == nullptr) {
+        LOG_ERROR("A5 HBG percounter: failed to obtain %" PRIu64 " scheduler state bytes", layout.total_size);
+        return false;
+    }
+    const uint64_t aligned_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
+
+    // The fanin table stores absolute device addresses, so the build has to know
+    // where this host image is going to land, not where it currently sits.
+    pc::BuildResult build{};
+    if (!pc::build_tables(
+            inputs.data(), static_cast<uint64_t>(total_tasks), layout, host_base, aligned_address, &build
+        )) {
+        LOG_ERROR(
+            "A5 HBG percounter: %s (task id=%" PRId64 ", fanin index=%d)", pc::build_status_name(build.status),
+            build.task_id, build.fanin_index
+        );
+        return false;
+    }
+
+    runtime->publish_scheduler_bootstrap(
+        SCHEDULER_RUNTIME_MODE_PERCOUNTER, aligned_address + layout.control_offset
+    );
+    // Deliberately no scheduler_state_owners entry. That record exists so
+    // publish_aicore_scheduler_profiling can copy the resident state back and
+    // read its traces, and it is typed by AicoreSchedulerLayout, which this mode
+    // does not have. Leaving it out makes that pass find nothing and return
+    // early, which is correct: percounter has no such traces yet. The storage
+    // itself is retained per pipeline slot and freed by the runner, not by this
+    // record, so skipping it leaks nothing.
+    runtime->add_pending_metadata(
+        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
+        HostPhaseKind::Count, {}
+    );
+    LOG_INFO(
+        "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV, %" PRIu64 " edges)", total_tasks,
+        order_count[0], order_count[1], edge_count
+    );
+    return true;
+}
+
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
 ) {
+    namespace pc = simpler::hbg::percounter;
+
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
         LOG_ERROR(
             "A5 HBG AICore scheduler: invalid graph size tasks=%d window=%" PRIu64, total_tasks, task_window_size
         );
         return false;
+    }
+
+    // An unrecognised value fails the bind rather than being ignored. A
+    // misspelled scheduler knob that silently selects something else does not
+    // fail where it was set; it surfaces much later as a performance mystery.
+    pc::ModeRequest mode_request = pc::ModeRequest::AUTO;
+    if (!pc::resolve_mode_request(&mode_request)) {
+        LOG_ERROR(
+            "A5 HBG: %s must be auto, legacy, resident or percounter", pc::SIMPLER_HBG_SCHEDULER_ENV
+        );
+        return false;
+    }
+    if (mode_request == pc::ModeRequest::LEGACY) {
+        select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED);
+        LOG_INFO("A5 HBG: AICPU scheduling requested via %s", pc::SIMPLER_HBG_SCHEDULER_ENV);
+        return true;
     }
     SchedulerGraphView host_graph{
         reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage),
@@ -1029,6 +1150,16 @@ bool create_scheduler_state(
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
         if (slot.task_kind == TaskKind::GRAPH) {
+            // Only AUTO is allowed to fall back. A caller that pinned a device
+            // scheduler gets told the graph cannot have one, rather than a
+            // silent downgrade that makes the next benchmark inexplicable.
+            if (pc::mode_request_needs_device_scheduler(mode_request)) {
+                LOG_ERROR(
+                    "A5 HBG: %s=%s cannot run a graph-execution task (id=%" PRId64 ")",
+                    pc::SIMPLER_HBG_SCHEDULER_ENV, pc::mode_request_name(mode_request), task_id
+                );
+                return false;
+            }
             select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
             LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
             return true;
@@ -1180,12 +1311,28 @@ bool create_scheduler_state(
         return false;
     }
     if (legacy_shape_task_id >= 0) {
+        if (pc::mode_request_needs_device_scheduler(mode_request)) {
+            LOG_ERROR(
+                "A5 HBG: %s=%s cannot run task id=%" PRId64 " with MIX, SPMD, or sync-start shape",
+                pc::SIMPLER_HBG_SCHEDULER_ENV, pc::mode_request_name(mode_request), legacy_shape_task_id
+            );
+            return false;
+        }
         select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
             "A5 HBG: retaining AICPU scheduling for task id=%" PRId64 " with MIX, SPMD, or sync-start shape",
             legacy_shape_task_id
         );
         return true;
+    }
+
+    // The graph is a v0 shape, so both device schedulers can run it. AUTO keeps
+    // taking resident; percounter is opt-in until it has hardware numbers of its
+    // own to compare against.
+    if (mode_request == pc::ModeRequest::PERCOUNTER) {
+        return create_percounter_state(
+            runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids
+        );
     }
 
     AicoreSchedulerLayout layout{};

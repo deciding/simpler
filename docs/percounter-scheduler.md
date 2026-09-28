@@ -1,6 +1,6 @@
 # Percounter: a pull-based AICore scheduler
 
-**Status**: design, not implemented; P0/P0b hardware measurements done (§4).
+**Status**: P0/P0b measured (§4), P1 host side implemented; device side (P2) not started.
 Target: a5 `host_build_graph` only.
 
 A third device-scheduling mode next to `legacy` (AICPU 3S+1P) and `resident`
@@ -13,10 +13,11 @@ There is no wake list, no ready inbox, no directory, and no work stealing.
 
 ```text
 per lane (AIC and AIV alike):
-  q = (my_cluster, my_core_type)                  # one ticket per cluster per type
-  k = atomicAdd(ticket[q], 1)                     # claim the next task
-  if k >= order_count[q]: steal from another q, else drain and wait for EXIT
-  t = order[q][k]
+  ty = my_core_type                               # AIC or AIV
+  k  = atomicAdd(ticket[ty][my_cluster], 1)       # one ticket per cluster per type
+  i  = my_cluster + k * cluster_count             # strided slice of one ascending list
+  if i >= order_count[ty]: try another cluster's ticket, else drain and wait for EXIT
+  t  = order[ty][i]
   for a in fanin_addr[e.fanin_begin .. +fanin_count]:
       spin until ld_dev(a) >= 1                   # ~98 cyc; spin only, never sleep
   materialize args into my DispatchPayload slot
@@ -69,8 +70,28 @@ reset**, and no epoch scheme is needed for v0.
 | `PercounterFanin[task]` (new) | `fanin_count`, `fanin_begin` | the only per-task data `SchedulerTaskMetadata` lacks |
 | `fanin_addr[]` (new) | `uint64_t` absolute GM address of each producer's counter | the host knows the device base at bind time |
 | `counter[task]` (new) | `uint64_t`, **one per 64 B cache line** | 0 initially; host presets 1 for inline-completed tasks. Padding is not optional — see §4 |
-| `order[q][]` (new) | one ascending `int32` task-id list per queue, `q = (cluster, core_type)` | round-robin over clusters keeps each list a topological subsequence |
-| `PercounterControl` (new) | `ticket[q]`, `order_count[q]`, segment offsets | up to 36 clusters x 2 core types; **each ticket on its own 64 B line** — §4 shows why |
+| `order[2][]` (new) | one ascending `int32` task-id list **per core type**, not per queue | see below: the host cannot know the cluster count |
+| `PercounterControl` (new) | `ticket[2][36]`, `order_count[2]`, segment offsets | **each ticket on its own 64 B line** — §4 shows why |
+
+### Why the order lists are per core type, not per queue
+
+**The host does not know the topology at bind time.** `post_handshake_init`
+discovers the cluster count on the AICPU and overwrites the `core_type` and
+`type_rank` the host guessed. A host that partitioned tasks into 36 x 2 queues
+on a board that brings up 8 clusters would strand every task in the 28 queues
+nothing ever claims — a deadlock, not an imbalance.
+
+So the host builds **one ascending list per core type** and the device maps its
+own queue onto a strided slice:
+
+```
+i = my_cluster + k * cluster_count
+```
+
+A strided slice of an ascending list is still ascending, so §1's
+deadlock-freedom argument carries over unchanged, and `cluster_count` is only
+needed where it is actually known. It also removes the per-queue arrays: the
+only per-queue state left is the ticket itself.
 
 `SchedulerRunControl` gains a `percounter_control_offset`; its `static_assert`
 moves with it.
@@ -305,7 +326,7 @@ percounter does not call it, so that check is not in the way.
 | --- | --- | --- |
 | **P0** | ~~stride sweep, fanin spin cost, ticket crossover~~ | **done** — `a5_test/ascendc/counter_deps/`, results in §4 |
 | **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `ld_dev` wins at ~98 cyc, ticket shards per cluster |
-| **P1** | host: env parsing, constants, layout, table build | C++ unit tests under `tests/ut/cpp/a5/runtime/host_build_graph/`: env values incl. invalid, layout, fanin addresses, order partition, counter presets |
+| **P1** | ~~host: env parsing, constants, layout, table build~~ | **done** — [`percounter-p1-plan.md`](percounter-p1-plan.md); 26 new cases, 264/264 ut-cpp passing |
 | **P2** | AICPU predicate, AICore branch, `run_percounter_executor` | builds; a5sim |
 | **P3** | sim scene tests | `vector_example`, `single_core_dag`, `multi_core_dag`, `empty_lifecycle` across all three modes, plus a new wide/deep mixed AIC+AIV DAG and an assertion that percounter really ran |
 | **P4** | onboard | `onboard-arch-precheck`, then `task-submit`; device Total and chip swimlane across the three modes |

@@ -20,6 +20,13 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // legacy dependency scheduler while continuing to pass result-only tests.
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
+// Percounter: every lane claims its own task from a per-cluster ticket and
+// spins on its producers' GM counters. No wake list, inbox or directory.
+constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
+// Legacy because the caller asked for it, not because a shape forced it. The
+// two are separate so a log or a terminal record can tell a deliberate choice
+// from a fallback.
+constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED = 6;
 
 struct AicoreSchedulerLayout {
     uint64_t total_size;
