@@ -1,6 +1,7 @@
 # Percounter: a pull-based AICore scheduler
 
-**Status**: design, not implemented. Target: a5 `host_build_graph` only.
+**Status**: design, not implemented; P0 hardware measurements done (§4).
+Target: a5 `host_build_graph` only.
 
 A third device-scheduling mode next to `legacy` (AICPU 3S+1P) and `resident`
 (one scheduler AIV per cluster). Percounter keeps resident's premise — resolve
@@ -55,7 +56,7 @@ reset**, and no epoch scheme is needed for v0.
 | `SchedulerTaskMetadata[task]` | reused unchanged | already carries `kernel_ids[3]`, `active_mask`, `flags`, `timing_slot` |
 | `PercounterFanin[task]` (new) | `fanin_count`, `fanin_begin` | the only per-task data `SchedulerTaskMetadata` lacks |
 | `fanin_addr[]` (new) | `uint64_t` absolute GM address of each producer's counter | the host knows the device base at bind time |
-| `counter[task]` (new) | `uint64_t`, packed | 0 initially; host presets 1 for inline-completed tasks |
+| `counter[task]` (new) | `uint64_t`, **one per 64 B cache line** | 0 initially; host presets 1 for inline-completed tasks. Padding is not optional — see §4 |
 | `order[2][]` (new) | one ascending `int32` task-id list per core type | |
 | `PercounterControl` (new) | `ticket[2]`, `order_count[2]`, segment offsets | each ticket on its own cache line |
 
@@ -96,9 +97,11 @@ line:
 atomic RMW targets) deliberately share line 0, while `next_waiter` (published
 through the cache) is pinned to offset 64.
 
-The counter array contains counters only, written exclusively by `atomicAdd` and
-read exclusively by `ld_dev`, so packing them is consistent with that rule —
-**but this is inferred from the code, not measured**, which is what P0 settles.
+The counter array contains counters only, written exclusively by `atomicAdd`.
+P0 measured what that buys: packing is **correct** but costs linearly in
+counters per line, and a plain load never observes a remote atomic at all. So
+the array is padded to one counter per line and the spin uses an explicit
+invalidate (or an atomic read — §4).
 
 Publication order per task: `execute_task` ends in `OUT_OF_ORDER_STORE_BARRIER`
 (`dsb(DSB_DDR)`), then `atomicAdd(counter[t], 1)`. A consumer that observes the
@@ -106,32 +109,114 @@ counter has therefore observed the outputs.
 
 ## 4. Measured costs that constrain the design
 
-From `a5_test` (`docs/atomic-latency-analysis.md`, `docs/gm-lat-analysis.md`),
-card 0, 96 cores, 1 cycle = 1 ns:
+P0 measured the three properties this design rests on, on one card with 96 cores
+(32 AIC + 64 AIV), 1 cycle = 1 ns. Probe and raw data:
+`a5_test/ascendc/counter_deps/`, analysis in
+`a5_test/docs/counter-deps-analysis.md`. Background figures come from the
+earlier `atomic_latency` and `gm_lat` probes in the same repo.
 
 | Quantity | Value |
 | --- | --- |
 | Empty-loop floor | 19.8 cyc |
-| Uncontended `atomicAdd` | ~425 cyc net, flat from 24 to 96 cores |
-| Same-address service interval `S` | ~169.5 cyc, independent of core count |
+| Uncontended `atomicAdd`, one counter per 64 B line | 431 cyc |
+| Same-address service interval `S` | ~170–181 cyc, independent of core count |
 | GM scalar read: L1 / L2 / HBM | 4.25 / ~88 / ~270 cyc |
 
-**The global ticket is a hot address.** `S = 169.5 ns` caps it at ~5.9 M
-claims/s. Split by core type, the AIV ticket serves 64 cores, so a lane waits
-~10.8 µs per claim; the AIC ticket serves 32 cores, ~5.4 µs.
+### The atomic unit serialises per cache line
 
-> If the mean task is shorter than ~10 µs, the ticket — not the work — sets the
-> throughput ceiling.
+Counters at `stride` uint32 apart, each core chaining on its own:
 
-That is the central risk. v0 keeps one ticket per core type so the baseline is
-clean and the effect is directly measurable; batching (`atomicAdd(ticket, k)`)
-and per-cluster sharding are the two escapes, and sharding converges back toward
-resident's inbox-plus-steal design.
+| counters per 64 B line | cyc/atomic | vs one-per-line | correct? |
+| --- | --- | --- | --- |
+| 16 | 6371 | 14.8x | yes |
+| 8 | 3259 | 7.6x | yes |
+| 4 | 1931 | 4.5x | yes |
+| 2 | 943 | 2.2x | yes |
+| 1 | 431 | 1.0x | yes |
 
-The other structural cost is **head-of-line blocking**: a lane that has claimed a
-task spins on its fanin and cannot run a different ready task meanwhile. Ascending
-task id is the only ordering v0 offers; a lookahead window over the next few
-tickets is the obvious follow-up.
+Packing is **correct** at every stride — the non-coherent machine does not lose
+a neighbour's increment — but the cost tracks counters-per-line almost exactly.
+So **each counter takes its own 64 B line**: 64 B per task, 640 KB for a 10k-task
+graph, far inside the 64 MB L2. The compact `uint64 counter[task]` array this
+design first assumed is out; the padding is the only change and it is free.
+
+### A remote counter is only visible through an invalidate
+
+95 cores spinning on one address that a 96th publishes once:
+
+| read idiom | cyc/poll | observed it |
+| --- | --- | --- |
+| `GlobalTensor::GetValue` | 7.3 | 0 / 285 |
+| volatile `__gm__` deref | 248.7 | 0 / 285 |
+| `dcci(SINGLE_CACHE_LINE)` + `dsb` + deref | 1229 | **285 / 285** |
+
+The producer is confirmed to have published, so the two zeros are visibility
+failures, not a missing write. A plain load — even a volatile one doing a real
+249 cyc access — never observes a remote atomic. This is the runtime's own rule
+arriving from the other side: `scheduler_observe_cache_line` is load-bearing.
+
+**1229 cyc is an upper bound, not the design figure.** Most of it is the `dsb`
+pipeline drain, not the read. Two cheaper idioms are untested and both should
+beat it:
+
+- `AtomicAdd(ptr, 0)` — an atomic read through the atomic unit, which the stride
+  result already proves is coherent across cores. Uncontended that is ~431 cyc,
+  2.9x better; and a real DAG has a handful of consumers per producer, not 95,
+  so it sits in the uncontended regime.
+- `__builtin_cce_ld_dev` — what `scheduler_gm_query` uses: a device load with no
+  RMW, so plausibly cheaper still.
+
+P0b closes this before any spin loop is written.
+
+### The ticket is a congestion curve, not a fixed cost
+
+Each core claims 200 times, burning `work` cycles between claims. The claim is a
+**dependent** chain, because the returned value is the task id:
+
+| work (cyc) | cyc per claim | limited by |
+| --- | --- | --- |
+| 0 | 16177 | ticket |
+| 1000 | 16181 | ticket |
+| 5000 | 16182 | ticket |
+| 20000 | 20000.1 | work |
+
+> An earlier revision discarded the return value. The atomic is posted, so the
+> claim pipelined and the floor read 3686 cyc — 4.4x optimistic. Percounter
+> cannot use that number.
+
+This is the same congestion law `atomic_latency`'s sparse sweep found, and the
+two agree: a shared address saturates when the arrival rate exceeds the service
+rate, i.e. when cores touch it more often than `S x ncores` apart.
+
+```
+crossover ~= S x (cores sharing the ticket) ~= 181 x 96 ~= 17.4 us
+```
+
+Below it the ticket sets the ceiling; **above it the ticket is nearly free** —
+at work=20000 it added 0.14 cyc. The threshold scales **linearly with the number
+of cores on that ticket**, which is the lever:
+
+| ticket sharding | cores per ticket | crossover |
+| --- | --- | --- |
+| one global | 96 | ~17.4 µs |
+| per core type | 64 (AIV) / 32 (AIC) | ~11.6 / ~5.8 µs |
+| per cluster | 3 | **~0.54 µs** |
+
+So sharding does not merely help, it removes the problem: per-cluster tickets
+put any task longer than ~0.5 µs in the free regime. That is a much smaller step
+than resident's inbox-plus-steal — a ticket per cluster is still a counter, with
+no queue, no directory and no stealing — so the earlier framing of sharding as
+"converging back on resident" was wrong.
+
+v0 keeps one ticket per core type so the baseline stays measurable, and P4
+compares it against per-cluster sharding.
+
+### Head-of-line blocking
+
+A lane that has claimed a task spins on its fanin and cannot run a different
+ready task meanwhile. Ascending task id is the only ordering v0 offers. The poll
+cost above sets how much this hurts, which is another reason P0b matters: at
+431 cyc a blocked lane is cheap to leave spinning, at 1229 it is not.
 
 ## 5. Mode selection
 
@@ -179,7 +264,8 @@ percounter does not call it, so that check is not in the way.
 
 | Phase | Work | Verification |
 | --- | --- | --- |
-| **P0** | extend the `a5_test` atomic probe with a stride parameter (8 B packed vs 64 B per line): does a packed `atomicAdd` array stay correct, and what does it cost? Separately, measure ticket throughput. | one card, minutes; result written to `docs/investigations/` |
+| **P0** | ~~stride sweep, fanin spin cost, ticket crossover~~ | **done** — `a5_test/ascendc/counter_deps/`, results in §4 |
+| **P0b** | the spin's read idiom: `AtomicAdd(ptr, 0)` and `__builtin_cce_ld_dev` against the measured `dcci` upper bound, at realistic consumer counts (2–8, not 95). Also per-cluster ticket sharding. | one card, minutes; extends the same probe |
 | **P1** | host: env parsing, constants, layout, table build | C++ unit tests under `tests/ut/cpp/a5/runtime/host_build_graph/`: env values incl. invalid, layout, fanin addresses, order partition, counter presets |
 | **P2** | AICPU predicate, AICore branch, `run_percounter_executor` | builds; a5sim |
 | **P3** | sim scene tests | `vector_example`, `single_core_dag`, `multi_core_dag`, `empty_lifecycle` across all three modes, plus a new wide/deep mixed AIC+AIV DAG and an assertion that percounter really ran |
