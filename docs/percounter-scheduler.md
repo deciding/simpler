@@ -1,6 +1,6 @@
 # Percounter: a pull-based AICore scheduler
 
-**Status**: design, not implemented; P0 hardware measurements done (§4).
+**Status**: design, not implemented; P0/P0b hardware measurements done (§4).
 Target: a5 `host_build_graph` only.
 
 A third device-scheduling mode next to `legacy` (AICPU 3S+1P) and `resident`
@@ -13,11 +13,12 @@ There is no wake list, no ready inbox, no directory, and no work stealing.
 
 ```text
 per lane (AIC and AIV alike):
-  k = atomicAdd(ticket[my_core_type], 1)          # claim the next task
-  if k >= order_count[my_core_type]: drain, wait for EXIT
-  t = order[my_core_type][k]
+  q = (my_cluster, my_core_type)                  # one ticket per cluster per type
+  k = atomicAdd(ticket[q], 1)                     # claim the next task
+  if k >= order_count[q]: steal from another q, else drain and wait for EXIT
+  t = order[q][k]
   for a in fanin_addr[e.fanin_begin .. +fanin_count]:
-      spin until ld_dev(a) >= 1                   # spin only, never sleep
+      spin until observe(a) >= 1                  # dcci + read; spin only, never sleep
   materialize args into my DispatchPayload slot
   execute_task(payload)                           # skipped when INLINE or predicate FAIL
   atomicAdd(counter[t], 1)                        # publish completion
@@ -32,16 +33,27 @@ in order and never recycles one"
 ([`orchestrator.cpp:1515-1545`](../src/common/host_build_graph/host/orchestrator.cpp)),
 so every fanin edge points to a strictly lower id. Ascending `task_id` is
 therefore a valid topological order: the host does not sort, it only partitions
-tasks into one list per core type. `build_percounter_tables` still asserts
+tasks into one list per queue. `build_percounter_tables` still asserts
 `producer_id < consumer_id` per edge — it is O(edges) and turns the load-bearing
 assumption into a bind-time failure rather than a device hang.
 
-**Splitting the order by core type cannot deadlock.** Both lists are ascending
-subsequences of one global topological order. Take T, the lowest-id incomplete
-task. Every dependency of T has a smaller id, so it is complete. Every task
-ahead of T in its own list has a smaller id, so it is complete too and its core
-is free. T is therefore claimable and runnable. This holds as long as a claimed
+**Splitting the order across queues cannot deadlock**, however many queues there
+are. Every list is an ascending subsequence of one global topological order, and
+round-robin assignment preserves that. Take T, the lowest-id incomplete task.
+Every dependency of T has a smaller id, so it is complete. Every task ahead of T
+in its own list has a smaller id, so it is complete too and that queue's cores
+are free. T is therefore claimable and runnable. This holds as long as a claimed
 task is never abandoned and cores are not preempted.
+
+**But sharding buys throughput with load balance.** §4 shows one global ticket
+caps a 96-core run at a claim per 16.2 µs, and a per-cluster ticket at 508 ns —
+so v0 shards. The cost is that a queue whose tasks happen to be short drains
+early and its cores idle while another queue still has work; a single global
+ticket cannot have that problem. The pseudocode above therefore ends an empty
+queue by trying another one, which is a second `atomicAdd` on a different
+counter, not a work-stealing protocol. Whether static round-robin plus that
+fallback is enough, or the partition needs to be duration-aware, is open and
+P4 measures it.
 
 ## 2. GM layout
 
@@ -57,8 +69,8 @@ reset**, and no epoch scheme is needed for v0.
 | `PercounterFanin[task]` (new) | `fanin_count`, `fanin_begin` | the only per-task data `SchedulerTaskMetadata` lacks |
 | `fanin_addr[]` (new) | `uint64_t` absolute GM address of each producer's counter | the host knows the device base at bind time |
 | `counter[task]` (new) | `uint64_t`, **one per 64 B cache line** | 0 initially; host presets 1 for inline-completed tasks. Padding is not optional — see §4 |
-| `order[2][]` (new) | one ascending `int32` task-id list per core type | |
-| `PercounterControl` (new) | `ticket[2]`, `order_count[2]`, segment offsets | each ticket on its own cache line |
+| `order[q][]` (new) | one ascending `int32` task-id list per queue, `q = (cluster, core_type)` | round-robin over clusters keeps each list a topological subsequence |
+| `PercounterControl` (new) | `ticket[q]`, `order_count[q]`, segment offsets | up to 36 clusters x 2 core types; **each ticket on its own 64 B line** — §4 shows why |
 
 `SchedulerRunControl` gains a `percounter_control_offset`; its `static_assert`
 moves with it.
@@ -140,7 +152,7 @@ So **each counter takes its own 64 B line**: 64 B per task, 640 KB for a 10k-tas
 graph, far inside the 64 MB L2. The compact `uint64 counter[task]` array this
 design first assumed is out; the padding is the only change and it is free.
 
-### A remote counter is only visible through an invalidate
+### A remote counter is only visible through an invalidate, and that is cheap
 
 95 cores spinning on one address that a 96th publishes once:
 
@@ -148,75 +160,78 @@ design first assumed is out; the padding is the only change and it is free.
 | --- | --- | --- |
 | `GlobalTensor::GetValue` | 7.3 | 0 / 285 |
 | volatile `__gm__` deref | 248.7 | 0 / 285 |
-| `dcci(SINGLE_CACHE_LINE)` + `dsb` + deref | 1229 | **285 / 285** |
+| `dcci(SINGLE_CACHE_LINE)` + `dsb` + deref | 1144 | **285 / 285** |
+| `AtomicAdd(ptr, 0)` | 16108 | 193 / 285 |
 
 The producer is confirmed to have published, so the two zeros are visibility
 failures, not a missing write. A plain load — even a volatile one doing a real
-249 cyc access — never observes a remote atomic. This is the runtime's own rule
-arriving from the other side: `scheduler_observe_cache_line` is load-bearing.
+249 cyc access — never observes a remote atomic. `scheduler_observe_cache_line`
+is load-bearing, not defensive.
 
-**1229 cyc is an upper bound, not the design figure.** Most of it is the `dsb`
-pipeline drain, not the read. Two cheaper idioms are untested and both should
-beat it:
+But 95 consumers on one address is the worst case, not the operating point:
 
-- `AtomicAdd(ptr, 0)` — an atomic read through the atomic unit, which the stride
-  result already proves is coherent across cores. Uncontended that is ~431 cyc,
-  2.9x better; and a real DAG has a handful of consumers per producer, not 95,
-  so it sits in the uncontended regime.
-- `__builtin_cce_ld_dev` — what `scheduler_gm_query` uses: a device load with no
-  RMW, so plausibly cheaper still.
+| consumers on one producer | `dcci` cyc/poll | `AtomicAdd(ptr,0)` cyc/poll |
+| --- | --- | --- |
+| 2 | **327** | 339 |
+| 4 | **335** | 677 |
+| 8 | **336** | 1351 |
+| 95 | 1144 | 16108 |
 
-P0b closes this before any spin loop is written.
+`dcci` is flat at ~330 cyc through fanout 8. The atomic read scales as
+`169 x consumers` — every poll is an RMW queueing at the atomic unit, where a
+read is not — so it is only competitive at fanout 2. It looks like the natural
+"atomic read" and it is a trap.
 
-### The ticket is a congestion curve, not a fixed cost
+**A fanin check therefore costs ~330 cyc**, about one uncontended atomic. A
+lane left spinning on a producer is affordable.
+
+### The ticket is a congestion curve, and sharding flattens it
 
 Each core claims 200 times, burning `work` cycles between claims. The claim is a
-**dependent** chain, because the returned value is the task id:
+**dependent** chain, because the returned value is the task id. `L_core` in
+cycles; **bold** = ticket-limited, plain = tracking `work`:
 
-| work (cyc) | cyc per claim | limited by |
-| --- | --- | --- |
-| 0 | 16177 | ticket |
-| 1000 | 16181 | ticket |
-| 5000 | 16182 | ticket |
-| 20000 | 20000.1 | work |
-
-> An earlier revision discarded the return value. The atomic is posted, so the
-> claim pipelined and the floor read 3686 cyc — 4.4x optimistic. Percounter
-> cannot use that number.
-
-This is the same congestion law `atomic_latency`'s sparse sweep found, and the
-two agree: a shared address saturates when the arrival rate exceeds the service
-rate, i.e. when cores touch it more often than `S x ncores` apart.
+| cores | work=0 | 5000 | 8000 | 11000 | 14000 | 17000 | 20000 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 3 | **508** | 5000 | 8000 | 11000 | 14000 | 17000 | 20000 |
+| 6 | **1016** | 5000 | 8000 | 11000 | 14000 | 17000 | 20000 |
+| 12 | **2031** | 5000 | 8000 | 11000 | 14000 | 17000 | 20000 |
+| 24 | **4060** | 5000 | 8000 | 11000 | 14000 | 17000 | 20000 |
+| 48 | **8119** | **8119** | **8117** | 11000 | 14000 | 17000 | 20000 |
+| 96 | **16184** | **16182** | **16175** | **16179** | **16182** | 17000 | 20000 |
 
 ```
-crossover ~= S x (cores sharing the ticket) ~= 181 x 96 ~= 17.4 us
+floor = crossover = S x ncores,  S = 169.2 cyc, constant over a 32x core range
 ```
 
-Below it the ticket sets the ceiling; **above it the ticket is nearly free** —
-at work=20000 it added 0.14 cyc. The threshold scales **linearly with the number
-of cores on that ticket**, which is the lever:
+The floor *is* the crossover: below it the ticket sets the pace, above it the
+ticket costs **0.14 cyc**. No middle ground, no penalty on the free side.
 
-| ticket sharding | cores per ticket | crossover |
+> An earlier revision discarded the claim's return value. The atomic is posted,
+> so the claim pipelined and the floor read 3686 cyc — 4.4x optimistic.
+> Percounter cannot use that number.
+
+Since the crossover scales linearly with the cores sharing one ticket, the
+number of tickets is the lever:
+
+| sharding | cores/ticket | crossover |
 | --- | --- | --- |
-| one global | 96 | ~17.4 µs |
-| per core type | 64 (AIV) / 32 (AIC) | ~11.6 / ~5.8 µs |
-| per cluster | 3 | **~0.54 µs** |
+| one global | 96 | 16.2 µs |
+| per core type | 64 AIV / 32 AIC | 10.8 / 5.4 µs |
+| **per cluster** | **3** | **0.51 µs** |
 
-So sharding does not merely help, it removes the problem: per-cluster tickets
-put any task longer than ~0.5 µs in the free regime. That is a much smaller step
-than resident's inbox-plus-steal — a ticket per cluster is still a counter, with
-no queue, no directory and no stealing — so the earlier framing of sharding as
-"converging back on resident" was wrong.
-
-v0 keeps one ticket per core type so the baseline stays measurable, and P4
-compares it against per-cluster sharding.
+A per-cluster ticket saturates at **508 cyc** with zero-length tasks — within
+18% of a completely uncontended atomic (431 cyc). **v0 therefore shards the
+ticket per cluster**, which is 36 counters and still no queue, no directory and
+no stealing. The draft's claim that sharding "converges back on resident" was
+wrong.
 
 ### Head-of-line blocking
 
 A lane that has claimed a task spins on its fanin and cannot run a different
 ready task meanwhile. Ascending task id is the only ordering v0 offers. The poll
-cost above sets how much this hurts, which is another reason P0b matters: at
-431 cyc a blocked lane is cheap to leave spinning, at 1229 it is not.
+cost above settles how much this hurts: at ~330 cyc a check, a blocked lane is
+cheap to leave spinning, so v0 does not need a lookahead window.
 
 ## 5. Mode selection
 
@@ -265,7 +280,7 @@ percounter does not call it, so that check is not in the way.
 | Phase | Work | Verification |
 | --- | --- | --- |
 | **P0** | ~~stride sweep, fanin spin cost, ticket crossover~~ | **done** — `a5_test/ascendc/counter_deps/`, results in §4 |
-| **P0b** | the spin's read idiom: `AtomicAdd(ptr, 0)` and `__builtin_cce_ld_dev` against the measured `dcci` upper bound, at realistic consumer counts (2–8, not 95). Also per-cluster ticket sharding. | one card, minutes; extends the same probe |
+| **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `dcci` + read wins at ~330 cyc, ticket shards per cluster |
 | **P1** | host: env parsing, constants, layout, table build | C++ unit tests under `tests/ut/cpp/a5/runtime/host_build_graph/`: env values incl. invalid, layout, fanin addresses, order partition, counter presets |
 | **P2** | AICPU predicate, AICore branch, `run_percounter_executor` | builds; a5sim |
 | **P3** | sim scene tests | `vector_example`, `single_core_dag`, `multi_core_dag`, `empty_lifecycle` across all three modes, plus a new wide/deep mixed AIC+AIV DAG and an assertion that percounter really ran |
