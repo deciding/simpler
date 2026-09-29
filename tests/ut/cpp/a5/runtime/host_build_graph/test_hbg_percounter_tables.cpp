@@ -267,7 +267,7 @@ TEST(PercounterTables, PlacesEachTaskInItsCoreTypeListInAscendingOrder) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    ASSERT_TRUE(pc::build_tables(graph.tasks.data(), 4, layout, region.base(), kDeviceBase, &result))
+    ASSERT_TRUE(pc::build_tables(graph.tasks.data(), 4, layout, region.base(), kDeviceBase, {}, &result))
         << pc::build_status_name(result.status);
 
     const auto *aic = pc::region_at<int32_t>(region.base(), layout.orders_offset[0]);
@@ -331,6 +331,43 @@ TEST(PercounterTables, ControlHeaderMirrorsThePlan) {
     EXPECT_EQ(control->tickets_offset, layout.tickets_offset);
 }
 
+// A lane reaches the task table and the callable table through these and
+// nothing else: neither lives in the percounter region. A zero here is a lane
+// that cannot materialize a payload.
+TEST(PercounterTables, CarriesTheAddressesThatLiveOutsideTheRegion) {
+    ChainGraph graph;
+    const uint64_t order_count[2] = {1, 2};
+    pc::PercounterLayout layout{};
+    ASSERT_TRUE(pc::plan_layout(4, graph.edges(), order_count, &layout));
+    Region region(layout.total_size);
+
+    pc::ExternalAddresses external{};
+    external.graph_storage = 0x1234'5000ull;
+    external.callable_table = 0x9876'0000ull;
+    external.callable_count = 17;
+    ASSERT_TRUE(pc::build_tables(graph.tasks.data(), 4, layout, region.base(), kDeviceBase, external));
+
+    const auto *control = pc::region_at<pc::PercounterControl>(region.base(), layout.control_offset);
+    EXPECT_EQ(control->graph_storage_address, external.graph_storage);
+    EXPECT_EQ(control->callable_addresses_address, external.callable_table);
+    EXPECT_EQ(control->callable_addresses_count, external.callable_count);
+    EXPECT_EQ(control->dispatch_payloads_offset, layout.dispatch_payloads_offset);
+    // The AICPU fills these after the handshake, so a freshly built region must
+    // not claim a topology it cannot know.
+    EXPECT_EQ(control->cluster_count, 0u);
+    EXPECT_EQ(control->aiv_per_cluster, 0u);
+}
+
+TEST(PercounterLayout, ReservesOneDispatchPayloadPerLane) {
+    const uint64_t order_count[2] = {1, 1};
+    pc::PercounterLayout layout{};
+    ASSERT_TRUE(pc::plan_layout(2, 0, order_count, &layout));
+    EXPECT_TRUE(is_aligned(layout.dispatch_payloads_offset, alignof(DispatchPayload)));
+    EXPECT_LE(
+        layout.dispatch_payloads_offset + SCHEDULER_WORKER_CAPACITY * sizeof(DispatchPayload), layout.total_size
+    );
+}
+
 // The load-bearing assumption of the whole design: ascending task id is already
 // a topological order, so a producer's id is always lower than its consumer's.
 // If that ever stops holding, a lane spins forever on a counter nobody will set
@@ -350,7 +387,7 @@ TEST(PercounterTables, RejectsAnEdgeThatDoesNotPointBackwards) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 3, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 3, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER);
     EXPECT_EQ(result.task_id, 1);
     EXPECT_EQ(result.fanin_index, 0);
@@ -365,7 +402,7 @@ TEST(PercounterTables, RejectsSelfEdges) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 1, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 1, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER);
 }
 
@@ -378,7 +415,7 @@ TEST(PercounterTables, RejectsAProducerOutsideTheGraph) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::PRODUCER_OUT_OF_RANGE);
 }
 
@@ -390,7 +427,7 @@ TEST(PercounterTables, RejectsABadCoreType) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 1, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 1, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::BAD_CORE_TYPE);
 }
 
@@ -405,7 +442,7 @@ TEST(PercounterTables, RejectsAPlanThatDisagreesWithTheTasks) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::ORDER_COUNT_MISMATCH);
 
     // A plan too LARGE passes plan_layout (it only bounds the total against the
@@ -416,7 +453,7 @@ TEST(PercounterTables, RejectsAPlanThatDisagreesWithTheTasks) {
     const uint64_t too_many[2] = {2, 0};  // one placeable AIC task, room for two
     ASSERT_TRUE(pc::plan_layout(2, 0, too_many, &layout));
     Region region2(layout.total_size);
-    EXPECT_FALSE(pc::build_tables(with_inline, 2, layout, region2.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(with_inline, 2, layout, region2.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::ORDER_COUNT_MISMATCH);
 }
 
@@ -440,7 +477,7 @@ TEST(PercounterTables, RejectsAnEdgeCountThatDisagrees) {
     Region region(layout.total_size);
 
     pc::BuildResult result{};
-    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, &result));
+    EXPECT_FALSE(pc::build_tables(tasks, 2, layout, region.base(), kDeviceBase, {}, &result));
     EXPECT_EQ(result.status, pc::BuildStatus::EDGE_COUNT_MISMATCH);
 }
 
@@ -450,7 +487,7 @@ TEST(PercounterTables, BuildsAnEmptyGraph) {
     ASSERT_TRUE(pc::plan_layout(0, 0, order_count, &layout));
     Region region(layout.total_size);
     pc::BuildResult result{};
-    EXPECT_TRUE(pc::build_tables(nullptr, 0, layout, region.base(), kDeviceBase, &result))
+    EXPECT_TRUE(pc::build_tables(nullptr, 0, layout, region.base(), kDeviceBase, {}, &result))
         << pc::build_status_name(result.status);
 }
 

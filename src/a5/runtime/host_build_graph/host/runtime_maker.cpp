@@ -1021,7 +1021,8 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
  */
 bool create_percounter_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids
+    const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
+    const sm_layout::SegmentOffsets &device_segments
 ) {
     namespace pc = simpler::hbg::percounter;
 
@@ -1080,9 +1081,17 @@ bool create_percounter_state(
 
     // The fanin table stores absolute device addresses, so the build has to know
     // where this host image is going to land, not where it currently sits.
+    // Neither of these lives in the percounter region, and a lane has no other
+    // way to reach them: the task table is in the shared-memory image and the
+    // callable table belongs to registration.
+    pc::ExternalAddresses external{};
+    external.graph_storage = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()) + device_segments.storage;
+    external.callable_table = runtime->callable_entry_table_addr();
+    external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
+
     pc::BuildResult build{};
     if (!pc::build_tables(
-            inputs.data(), static_cast<uint64_t>(total_tasks), layout, host_base, aligned_address, &build
+            inputs.data(), static_cast<uint64_t>(total_tasks), layout, host_base, aligned_address, external, &build
         )) {
         LOG_ERROR(
             "A5 HBG percounter: %s (task id=%" PRId64 ", fanin index=%d)", pc::build_status_name(build.status),
@@ -1331,7 +1340,7 @@ bool create_scheduler_state(
     // own to compare against.
     if (mode_request == pc::ModeRequest::PERCOUNTER) {
         return create_percounter_state(
-            runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids
+            runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
         );
     }
 

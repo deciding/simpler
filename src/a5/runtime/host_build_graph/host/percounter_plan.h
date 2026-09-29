@@ -137,6 +137,14 @@ struct PercounterLayout {
     uint64_t fanin_offset;
     uint64_t fanin_addr_offset;
     uint64_t counters_offset;
+    uint64_t dispatch_payloads_offset;
+};
+
+/** What the lane needs that lives outside this region, resolved by the host. */
+struct ExternalAddresses {
+    uint64_t graph_storage = 0;
+    uint64_t callable_table = 0;
+    uint64_t callable_count = 0;
 };
 
 /**
@@ -192,6 +200,7 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
+        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, DispatchPayload, dispatch_payloads_offset) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
         return false;
@@ -295,7 +304,7 @@ inline T *region_at(void *base, uint64_t offset)
  */
 inline bool build_tables(
     const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
-    BuildResult *result = nullptr
+    const ExternalAddresses &external = {}, BuildResult *result = nullptr
 )
 {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
@@ -369,6 +378,10 @@ inline bool build_tables(
     control->fanin_offset = layout.fanin_offset;
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
+    control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    control->graph_storage_address = external.graph_storage;
+    control->callable_addresses_address = external.callable_table;
+    control->callable_addresses_count = external.callable_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) {
         control->order_count[t] = layout.order_count[t];
         control->orders_offset[t] = layout.orders_offset[t];

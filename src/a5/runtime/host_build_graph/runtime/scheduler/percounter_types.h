@@ -106,9 +106,21 @@ struct alignas(128) PercounterControl {
     uint64_t resolved_task_count;
     // First failure wins; the supervisor breaks on any non-zero value.
     uint64_t lane_error;
-    uint8_t reserved[128 - 14 * sizeof(uint64_t)];
+    // Absolute device addresses the host resolves at bind, because none of them
+    // is inside this region and the lane has no other way to reach them: the
+    // task table lives in the shared-memory image and the callable table is
+    // owned by registration.
+    uint64_t graph_storage_address;
+    uint64_t callable_addresses_address;
+    uint64_t callable_addresses_count;
+    // One DispatchPayload per lane. Resident double-buffers because its
+    // scheduler fills the next payload while a worker runs the current one;
+    // a percounter lane fills its own and then runs it, so there is never a
+    // second one in flight.
+    uint64_t dispatch_payloads_offset;
+    uint8_t reserved[256 - 18 * sizeof(uint64_t)];
 };
-static_assert(sizeof(PercounterControl) == 128, "percounter control is one 128 B line");
+static_assert(sizeof(PercounterControl) == 256, "percounter control is two 128 B lines");
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
 
