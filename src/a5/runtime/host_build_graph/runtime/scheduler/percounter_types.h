@@ -49,8 +49,11 @@ inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = SCHEDULER_CLUSTER_CAPACIT
  * docs/percounter-scheduler.md §4.
  */
 struct alignas(64) PercounterCounter {
-    uint32_t value;
-    uint8_t reserved[60];
+    // uint64 to match scheduler_gm_fetch_add, which is the runtime.s only atomic
+    // add and is 64-bit. A percounter counter only has to reach 1, so the width
+    // is the primitive.s, not the design.s.
+    uint64_t value;
+    uint8_t reserved[56];
 };
 static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
 static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
@@ -61,8 +64,8 @@ static_assert(alignof(PercounterCounter) == 64, "counters must not straddle line
  * the counters do.
  */
 struct alignas(64) PercounterTicket {
-    uint32_t next;
-    uint8_t reserved[60];
+    uint64_t next;
+    uint8_t reserved[56];
 };
 static_assert(sizeof(PercounterTicket) == 64, "a ticket owns exactly one cache line");
 
@@ -118,7 +121,10 @@ struct alignas(128) PercounterControl {
     // a percounter lane fills its own and then runs it, so there is never a
     // second one in flight.
     uint64_t dispatch_payloads_offset;
-    uint8_t reserved[256 - 18 * sizeof(uint64_t)];
+    // The AICPU publishes this with the topology; a lane has no other source for
+    // it and every bounded spin needs one.
+    uint64_t scheduler_timeout_cycles;
+    uint8_t reserved[256 - 19 * sizeof(uint64_t)];
 };
 static_assert(sizeof(PercounterControl) == 256, "percounter control is two 128 B lines");
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);

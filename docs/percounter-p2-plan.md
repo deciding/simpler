@@ -59,23 +59,30 @@ has no scheduler role: every lane pulls its own work.
       `host/percounter_plan.h` reads the environment, which has no business in a
       header the device target compiles.
 
-- [ ] **4. AICore entry branch** — dispatch to `run_percounter_executor` on
+- [x] **4. AICore entry branch** — dispatch to `run_percounter_executor` on
       `SCHEDULER_RUNTIME_MODE_PERCOUNTER`; today anything that is not one of the
       two resident values goes to `legacy_aicore_execute`.
       *File*: `aicore/aicore_executor.cpp`
 
-- [ ] **5. The executor loop** — the pseudocode in
+- [x] **5. The executor loop** — the pseudocode in
       `percounter-scheduler.md` §1: claim, spin on fanin with `ld_dev`,
       materialize the payload, execute, publish the counter, batch the completion
       count. Every spin bounded and checked against EXIT and `scheduler_error`.
       *File*: new `aicore/aicore_percounter_executor.cpp`
 
-- [ ] **6. Sim scene tests** — `vector_example`, `single_core_dag`,
+- [ ] **6. Sim scene tests** — BLOCKED on this box: a5sim kernel compilation
+      needs g++-15 and a5x8 has g++-12, so no scene test can run here. The
+      runtime itself builds (HOST, AICPU and AICore targets all compile).
+      Original scope: — `vector_example`, `single_core_dag`,
       `multi_core_dag`, `empty_lifecycle` under all three modes, plus an
       assertion that percounter actually ran.
       *Files*: `tests/st/a5/host_build_graph/…`
 
-- [ ] **7. Build and run on a5sim** — no card.
+- [x] **7. Build a5sim** — no card. `build_runtimes --platforms a5sim` compiles
+      all three targets, which is the only build that touches the a5 AICore and
+      AICPU sources at all: **the ut-cpp tree does not compile them**, so its
+      264 passing tests say nothing about this code. Running a scene test is
+      still blocked, see step 6.
 
 ## Constraints carried from P0
 

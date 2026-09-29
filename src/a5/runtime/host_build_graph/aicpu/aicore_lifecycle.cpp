@@ -182,6 +182,9 @@ int32_t AicoreLifecycle::percounter_post_handshake_init(Runtime *runtime) {
     cache_invalidate_range(control, sizeof(*control));
     control->cluster_count = static_cast<uint64_t>(aic_count);
     control->aiv_per_cluster = static_cast<uint64_t>(PLATFORM_AIV_CORES_PER_BLOCKDIM);
+    // Every bounded spin on the lane side needs this, and a lane has no other
+    // source for it: the env override is read on the host, not the device.
+    control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
     cache_flush_range(control, sizeof(*control));
     wmb();
     LOG_INFO("A5 HBG percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);

@@ -17,6 +17,7 @@
 #include "dispatch_payload.h"
 #include "runtime.h"
 #include "scheduler/scheduler_memory.h"
+#include "aicore_percounter_executor.h"
 #include "scheduler/scheduler_ready.h"
 #include "scheduler/scheduler_watchdog.h"
 
@@ -62,6 +63,77 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPaylo
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+}
+
+/**
+ * The percounter lane's outer shell: wait for READY, run the loop, acknowledge
+ * EXIT.
+ *
+ * The three waits are all bounded and all also watch the exit register, because
+ * a lane that cannot be interrupted holds the card to the op timeout -- which
+ * kills aicpu-sd rather than failing the run.
+ */
+__aicore__ void run_percounter_executor(
+    __gm__ Runtime *runtime, __gm__ Handshake *handshake, int block_idx, CoreType core_type
+) {
+    __gm__ simpler::hbg::percounter::PercounterControl *control =
+        reinterpret_cast<__gm__ simpler::hbg::percounter::PercounterControl *>(
+            runtime->dev.scheduler_bootstrap.worker_context_base
+        );
+
+    // A null control block means the host published percounter without a
+    // region, which is a bind bug rather than a runtime condition. Acknowledge
+    // and leave: every wait below is bounded by a value that lives in the block
+    // this lane does not have.
+    if (control == nullptr) {
+        OUT_OF_ORDER_STORE_BARRIER();
+        write_reg(RegId::COND, AICORE_EXITED_VALUE);
+        return;
+    }
+    // Prefilled by the host at bind and overwritten by the AICPU with any env
+    // override, so it is readable before READY -- which the first wait needs.
+    const uint64_t timeout_cycles = scheduler_gm_query(control->scheduler_timeout_cycles);
+
+    // The AICPU publishes READY once it has written the topology into the
+    // control block. Without that wait a lane would read a cluster count of
+    // zero and place itself nowhere.
+    uint32_t startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+    const uint64_t ready_wait_start = get_sys_cnt_aicore();
+    while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_PERCOUNTER && startup_signal != AICORE_EXIT_SIGNAL) {
+        scheduler_observe_cache_line(handshake);
+        if (scheduler_watchdog_expired(ready_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
+            startup_signal = AICORE_EXIT_SIGNAL;
+            break;
+        }
+        startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        SPIN_WAIT_HINT();
+    }
+
+    if (startup_signal != AICORE_EXIT_SIGNAL) {
+        // The launch gate. Claiming before it opens would race the host's
+        // publication of the shared-memory image the payloads point into.
+        const uint64_t gate_wait_start = get_sys_cnt_aicore();
+        uint32_t gate = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        while (gate != AICPU_IDLE_TASK_ID && gate != AICORE_EXIT_SIGNAL) {
+            if (scheduler_watchdog_expired(gate_wait_start, get_sys_cnt_aicore(), timeout_cycles)) break;
+            gate = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+            SPIN_WAIT_HINT();
+        }
+        if (gate == AICPU_IDLE_TASK_ID) {
+            simpler::hbg::percounter::run_percounter_lane(control, block_idx, core_type);
+        }
+    }
+
+    // A lane that finished its stride still waits: the run is over when the
+    // AICPU says so, and leaving early would drop this core out of the teardown
+    // handshake platform_deinit_aicore_regs waits on.
+    const uint64_t exit_wait_start = get_sys_cnt_aicore();
+    while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) break;
+        SPIN_WAIT_HINT();
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+    write_reg(RegId::COND, AICORE_EXITED_VALUE);
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -653,6 +725,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
+    if (runtime_mode == SCHEDULER_RUNTIME_MODE_PERCOUNTER) {
+        run_percounter_executor(runtime, handshake, block_idx, core_type);
+        return;
+    }
     if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
         runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
         legacy_aicore_execute(runtime, block_idx, core_type);

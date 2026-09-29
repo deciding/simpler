@@ -379,6 +379,9 @@ inline bool build_tables(
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
     control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    // Prefilled so a lane can bound its READY wait, which happens before the
+    // AICPU has written anything. The AICPU overwrites it with any env override.
+    control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
     control->graph_storage_address = external.graph_storage;
     control->callable_addresses_address = external.callable_table;
     control->callable_addresses_count = external.callable_count;
