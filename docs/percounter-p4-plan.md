@@ -278,12 +278,42 @@ Simulation can confirm neither, since neither has any effect there.
       3–50× the steady value), two independent submissions. The two samples
       agree within 2% on every point, so the spread is not worth tabulating:
 
-      | case | percounter | resident | legacy | vs resident |
+      **Legacy is the baseline**, since it is the scheduler every shape can run
+      and the one a device scheduler has to beat to be worth having. `Ideal` is
+      measured, not assumed: per-task kernel durations come from a
+      `--enable-chip-swimlane 1` run, and the bound is the larger of the two
+      per-core-type work bounds — **AIC and AIV are not interchangeable**, the
+      chip has 32 AIC and 64 AIV cores, so `total work / 96` is the wrong floor.
+      For the chain the bound is instead the serial critical path, since no two
+      tasks may overlap.
+
+      | case | ideal | legacy | percounter | resident |
       | --- | --- | --- | --- | --- |
-      | `mixed_multi_root_4096` | **518 µs** | 655 | 3725 | 1.26× |
-      | `mixed_chain_1024` | **2657 µs** | 6461 | 5763 | 2.43× |
-      | `mixed_fanin32_1024` | **288 µs** | 7837 | 1167 | 27× |
-      | `mixed_random_1024` | **217 µs** | 830 | 1438 | 3.8× |
+      | `mixed_multi_root_4096` | 62 µs | 3725 µs (1.00×) | **518 µs (7.2×)** | 655 µs (5.7×) |
+      | `mixed_chain_1024` | 1168 µs | 5763 µs (1.00×) | **2657 µs (2.2×)** | 6461 µs (0.89×) |
+      | `mixed_fanin32_1024` | 48 µs | 1167 µs (1.00×) | **288 µs (4.1×)** | 7837 µs (0.15×) |
+      | `mixed_random_1024` | ≥21 µs | 1438 µs (1.00×) | **217 µs (6.6×)** | 830 µs (1.7×) |
+
+      Percounter beats legacy on every shape, by 2.2× to 7.2×. **Resident does
+      not**: it loses to legacy on the long chain (0.89×) and badly on the wide
+      fanin (0.15×, i.e. 6.7× slower), and only wins where there is little or no
+      dependency work to do.
+
+      Distance from ideal is the more useful number, and it says percounter has
+      real headroom rather than being near any floor:
+
+      | case | percounter vs ideal | legacy | resident |
+      | --- | --- | --- | --- |
+      | `mixed_multi_root_4096` | 8.4× | 60× | 10.6× |
+      | `mixed_chain_1024` | **2.3×** | 4.9× | 5.5× |
+      | `mixed_fanin32_1024` | 6.0× | 24× | 163× |
+
+      The chain is where percounter comes closest to ideal (2.3×), which makes
+      sense: a serial chain gives a scheduler nothing to parallelise, so what is
+      measured is per-edge hand-off latency, and percounter's is a counter
+      publish plus a device load. `mixed_random_1024`'s ideal is a lower bound
+      only — its critical path needs `deps.json` to compute, and only the work
+      bound is known.
 
       Percounter is ahead on every shape, and the ordering of the margins is the
       part that reads as evidence rather than luck. The 4096-task zero-edge case
