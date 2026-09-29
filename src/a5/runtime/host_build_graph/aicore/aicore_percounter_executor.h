@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include "aicore/chip_swimlane_collector_aicore.h"
+#include "common/chip_swimlane_profiling.h"
 #include "scheduler/percounter_types.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_memory.h"
@@ -79,6 +81,13 @@ struct LaneConfig {
     uint64_t order_count;
     uint64_t cluster_index;
     uint64_t cluster_count;
+    // Null unless SIMPLER_DFX_FLAG_CHIP_SWIMLANE is set for this run, which is
+    // what makes the whole of the tracing below cost one null test when
+    // profiling is off. The records themselves are platform storage, not
+    // percounter's: the per-core head is published by the AICPU in
+    // chip_swimlane_aicpu_init and handed to the lane by the kernel entry, so
+    // this mode needs no buffer of its own and no host-side plumbing.
+    __gm__ ChipSwimlaneActiveHead *swimlane_head;
 };
 
 /**
@@ -210,6 +219,11 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     __gm__ PercounterCounter *counters =
         scheduler_state_at<PercounterCounter>(cfg.control, scheduler_gm_query(cfg.control->counters_offset));
 
+    // Must start at a sequence the AICPU's head cannot already hold (its
+    // initial current_buf_seq is 0), so the first reservation sees a mismatch
+    // and loads the buffer pointer.
+    ChipSwimlaneAicoreLocalState swimlane_local = {nullptr, UINT32_MAX, 0};
+
     while (true) {
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) break;
         if (scheduler_gm_query(cfg.control->lane_error) != 0) break;
@@ -229,14 +243,39 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             break;
         }
 
+        // Reserved before the fanin wait, so the slot is this task's for the
+        // whole of it. `receive_time` is the claim rather than a dispatch,
+        // because nothing dispatches to a percounter lane -- which makes
+        // `receive_to_start_cycles` the fanin wait plus materialization, i.e.
+        // exactly the scheduling stall the critical-path tool wants to
+        // attribute.
+        __gm__ ChipSwimlaneAicoreTaskRecord *swimlane_record = nullptr;
+        uint64_t receive_time = 0;
+        if (cfg.swimlane_head != nullptr) {
+            swimlane_record = chip_swimlane_aicore_reserve_task_record(cfg.swimlane_head, &swimlane_local);
+            receive_time = get_sys_cnt_aicore();
+        }
+
         bool aborted = false;
         if (!percounter_wait_for_fanin(cfg, task_id, timeout_cycles, &aborted)) break;
 
+        const uint64_t start_time = cfg.swimlane_head != nullptr ? get_sys_cnt_aicore() : 0;
         if (!percounter_run_task(cfg, task_id)) {
             scheduler_gm_compare_exchange(
                 cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE)
             );
             break;
+        }
+        if (cfg.swimlane_head != nullptr) {
+            // Committed before the counter publish: a consumer that observes
+            // the counter may start immediately, and this record describes the
+            // task that just ended rather than anything after it. Both identity
+            // fields are the task id -- percounter dispatches each task once,
+            // so the host's join key and its canonical identity coincide.
+            chip_swimlane_aicore_commit_task_record(
+                swimlane_record, static_cast<uint64_t>(task_id), static_cast<uint32_t>(task_id), receive_time,
+                start_time, get_sys_cnt_aicore()
+            );
         }
 
         scheduler_gm_fetch_add(counters[task_id].value, 1);
@@ -246,6 +285,25 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         }
     }
     if (local_done != 0) scheduler_gm_fetch_add(cfg.control->resolved_task_count, local_done);
+
+    // Publish how many records this lane wrote, because nothing else can.
+    //
+    // The platform charges `live_record_count` in
+    // chip_swimlane_aicpu_on_aicore_dispatch -- its accounting assumes the AICPU
+    // dispatches every task and therefore knows the count, and the AICPU's flush
+    // publishes a core's buffer only when that count is non-zero. Percounter has
+    // no AICPU dispatch at all, so without this the buffer is written and then
+    // never collected, which is exactly why this mode produced no swimlane file.
+    //
+    // Safe for one lane to own: it is the only writer of its own buffer, the
+    // AICPU never rotates it here (rotation is driven by the same dispatch
+    // callback), and the read happens in finish_shutdown_partition, after every
+    // core has acknowledged EXIT.
+    if (cfg.swimlane_head != nullptr) {
+        cfg.swimlane_head->live_record_count = swimlane_local.slot_within_buf;
+        dcci(cfg.swimlane_head, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dsb((mem_dsb_t)0);
+    }
 }
 
 /**
@@ -306,6 +364,11 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
     cfg.cluster_index = static_cast<uint64_t>(coordinate.cluster_index);
     cfg.cluster_count = scheduler_gm_query(control->cluster_count);
+    // Platform storage, published by the AICPU before the gate; the kernel
+    // entry has already pointed this core at its own slot.
+    cfg.swimlane_head = SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE) ?
+                            get_chip_swimlane_aicore_head() :
+                            nullptr;
 
     percounter_lane_loop(cfg, timeout_cycles);
 }

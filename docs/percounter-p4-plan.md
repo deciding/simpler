@@ -385,6 +385,50 @@ is — see `running-onboard.md`'s triage table.
 | wrong results rather than a hang | the claim partition overlapping, which P3 should have caught and did not reproduce |
 | correct but far slower than resident | the line-isolation assumption failing, or ticket contention worse than P0's sharded measurement predicted |
 
+## Swimlane
+
+Percounter emits chip-swimlane records, so it can be profiled and compared on
+the same timeline as the other two modes. It could not before, and the reason
+is worth recording because it is a design boundary rather than an oversight.
+
+The device-side machinery is platform-level and mode-independent: the kernel
+entry binds each core to its own `ChipSwimlaneActiveHead` slot, and a lane only
+has to `chip_swimlane_aicore_reserve_task_record` before a task and
+`chip_swimlane_aicore_commit_task_record` after it. The AICPU half was already
+on percounter's path too — `chip_swimlane_aicpu_init` runs in
+`pre_handshake_init`, and the flush sits in `finish_shutdown_partition`, which
+percounter reaches because its supervisor was folded into the shared teardown.
+
+**What was missing is accounting.** `live_record_count` — the field whose
+non-zero value is what makes the AICPU publish a core's buffer — is charged in
+`chip_swimlane_aicpu_on_aicore_dispatch`. The platform assumes the AICPU
+dispatches every task and therefore knows how many records a core wrote.
+**Percounter has no AICPU dispatch; that is its premise.** So the records were
+written and then never collected, and the mode produced no file at all.
+
+The lane publishes its own count once at exit. It is the only writer of its own
+buffer, the AICPU never rotates it here (rotation is driven by the same dispatch
+callback that is absent), and the read happens after every core has acknowledged
+EXIT. No platform file is modified.
+
+Two consequences worth knowing:
+
+- **One buffer per core, no rotation.** `PLATFORM_AICORE_BUFFER_SIZE` is 1024
+  records per core; the largest graph here needs 128. A graph that gave one lane
+  more than 1024 tasks would silently lose the overflow, because
+  `chip_swimlane_aicore_reserve_task_record` returns null past the end rather
+  than rotating.
+- **It gives P7 for free.** The 1024 records carry 1024 *distinct* task ids, so
+  the trace proves each task ran exactly once — which is precisely the duplicate
+  execution the golden comparison cannot see, since its write is idempotent.
+
+Cost when profiling is off is a null test per task: `swimlane_head` is null
+unless `SIMPLER_DFX_FLAG_CHIP_SWIMLANE` is set. Measured with it off, the four
+timing points moved −8.7% to +6.9% while legacy and resident moved by similar
+amounts in both directions on the same submission, so there is no evidence of a
+regression. This is the same gating legacy and resident use, and is why it does
+not contradict removing the unconditional diagnostics earlier in this phase.
+
 ## Not in P4
 
 - Load balance across sharded tickets. A queue of short tasks drains early and
