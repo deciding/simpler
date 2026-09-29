@@ -32,16 +32,15 @@ inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
            mode == SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED;
 }
 
-// Still resident-only, deliberately. Widening this is what admits percounter to
-// the AICPU bring-up path, and that path has to learn to publish percounter's
-// topology first: as it stands it would find no context to hand over, spin in
-// wait_bootstrap_complete for a bootstrap_complete nobody sets, and end at the
-// scheduler timeout -- a hang on a shared card rather than an error. Until then
-// a percounter run falls through to the legacy branch below and is rejected
-// there, loudly and with the teardown legacy already owns.
+// Both device-scheduled modes take the AICPU bring-up path. They diverge at
+// exactly two of its steps -- AicoreLifecycle::percounter_post_handshake_init
+// and percounter_publish_partition -- and share discovery, the gate, the
+// supervisor and shutdown. Percounter also skips the bootstrap barrier
+// entirely: resident's lanes classify the whole graph before the gate opens,
+// while a percounter lane has nothing to do until it claims.
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode);
+           aicore_scheduler_runtime_mode_is_device(runtime->dev.scheduler_bootstrap.runtime_mode);
 }
 
 inline bool aicore_scheduler_percounter_enabled(const Runtime *runtime) {

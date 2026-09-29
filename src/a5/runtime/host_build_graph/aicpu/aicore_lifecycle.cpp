@@ -16,6 +16,7 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_watchdog.h"
+#include "scheduler/percounter_types.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -149,6 +150,61 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
         physical_core_ids_[core.worker_id] = core.physical_core_id;
     }
     if (record_lifecycle_timing) thread_handshake_timing_[tidx].end_cycles = get_sys_cnt_aicpu();
+}
+
+int32_t AicoreLifecycle::percounter_post_handshake_init(Runtime *runtime) {
+    auto *control = reinterpret_cast<simpler::hbg::percounter::PercounterControl *>(
+        aicore_percounter_control(runtime)
+    );
+    if (control == nullptr || handshake_failed_.load(std::memory_order_acquire)) return -1;
+
+    int32_t aic_count = 0;
+    int32_t aiv_count = 0;
+    for (int32_t i = 0; i < core_count_; ++i) {
+        if (cores_[i].core_type == CoreType::AIC) {
+            ++aic_count;
+        } else if (cores_[i].core_type == CoreType::AIV) {
+            ++aiv_count;
+        } else {
+            LOG_ERROR("A5 HBG percounter: core %d reported invalid core type", i);
+            return -1;
+        }
+    }
+    // The same topology contract resident checks. A lane derives its cluster
+    // arithmetically from these counts, so a partial bring-up would not fail
+    // loudly here, it would place lanes on clusters that do not exist.
+    if (aic_count <= 0 || aic_count > static_cast<int32_t>(SCHEDULER_CLUSTER_CAPACITY) ||
+        aiv_count != aic_count * PLATFORM_AIV_CORES_PER_BLOCKDIM) {
+        LOG_ERROR("A5 HBG percounter: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
+        return -1;
+    }
+
+    cache_invalidate_range(control, sizeof(*control));
+    control->cluster_count = static_cast<uint64_t>(aic_count);
+    control->aiv_per_cluster = static_cast<uint64_t>(PLATFORM_AIV_CORES_PER_BLOCKDIM);
+    cache_flush_range(control, sizeof(*control));
+    wmb();
+    LOG_INFO("A5 HBG percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
+    return 0;
+}
+
+void AicoreLifecycle::percounter_publish_partition(Runtime *runtime, int32_t thread_idx) {
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
+    if (aicore_percounter_control(runtime) == nullptr) return;
+    Handshake *handshakes = runtime->dev.workers;
+    for (int32_t i = lo; i < hi; ++i) {
+        // Same rule as the resident reply: a worker that did not report to this
+        // run is not told to proceed. On a stamped run that silence is exactly
+        // what its epoch check withheld.
+        if (cores_[i].reg_addr == 0) continue;
+        // No `task` pointer to order against this store, unlike resident: the
+        // control block address is already in the bootstrap word, which the
+        // host published before launch.
+        handshakes[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_PERCOUNTER;
+    }
+    if (hi > lo) cache_flush_range(&handshakes[lo], static_cast<size_t>(hi - lo) * sizeof(Handshake));
+    wmb();
 }
 
 int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {

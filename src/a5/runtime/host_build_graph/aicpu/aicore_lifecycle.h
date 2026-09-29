@@ -26,6 +26,21 @@ public:
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     int32_t post_handshake_init(Runtime *runtime);
     void publish_context_partition(Runtime *runtime, int32_t thread_idx);
+
+    // Percounter's replacements for the two steps above. It shares every other
+    // step of the bring-up, so only these two differ:
+    //
+    //  - configuration is two integers rather than a 108-entry context array,
+    //    because scheduler_cluster_coordinate_from_worker is a pure function of
+    //    them and the block index each lane already has;
+    //  - the hand-off carries no `task` pointer, because the control block
+    //    address is already in the bootstrap word.
+    //
+    // There is also no third difference to write down: percounter has no
+    // bootstrap barrier. Resident's lanes classify the whole graph before the
+    // gate opens; a percounter lane has nothing to do until it claims.
+    int32_t percounter_post_handshake_init(Runtime *runtime);
+    void percounter_publish_partition(Runtime *runtime, int32_t thread_idx);
     void begin_bootstrap_wait(int32_t thread_idx);
     void end_bootstrap_wait(int32_t thread_idx);
     int32_t wait_bootstrap_complete(Runtime *runtime);

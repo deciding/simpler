@@ -18,6 +18,7 @@
 #include "aicore_lifecycle.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
+#include "scheduler/percounter_types.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -89,6 +90,7 @@ struct AicpuExecutor {
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
+    int32_t percounter_supervise(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t finish_failed_init(Runtime *runtime);
     // Decide this run's terminal record while the state it reads is still
@@ -234,6 +236,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
     const bool is_leader = (tidx == 0);
+    // The bring-up is shared; percounter differs at two steps and skips a third.
+    const bool is_percounter = aicore_scheduler_percounter_enabled(runtime);
 
     if (is_leader) {
         LOG_INFO("AicpuExecutor: Initializing");
@@ -272,8 +276,10 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
         completion_gate_.reset();
-        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.post_handshake_init(runtime) != 0) {
-            init_failed_.store(true, std::memory_order_release);
+        if (!init_failed_.load(std::memory_order_acquire)) {
+            const int32_t config_rc = is_percounter ? aicore_lifecycle_.percounter_post_handshake_init(runtime)
+                                                    : aicore_lifecycle_.post_handshake_init(runtime);
+            if (config_rc != 0) init_failed_.store(true, std::memory_order_release);
         }
         hs_config_done_.store(true, std::memory_order_release);
     } else {
@@ -289,7 +295,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // observation, Ready bootstrap, and initial slot fill while the DMB gate
     // remains closed. This is a one-way publication, not a second launch gate.
     if (!init_failed_.load(std::memory_order_acquire)) {
-        aicore_lifecycle_.publish_context_partition(runtime, tidx);
+        if (is_percounter) {
+            aicore_lifecycle_.percounter_publish_partition(runtime, tidx);
+        } else {
+            aicore_lifecycle_.publish_context_partition(runtime, tidx);
+        }
     }
 
     // Only the leader polls the shared bootstrap line. Peers wait in AICPU
@@ -297,7 +307,13 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // cache line. The following release is the sole AICore-wide DMB gate.
     aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
-        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
+        // Percounter has no bootstrap to wait for. Resident's scheduler AIVs
+        // classify the whole graph before the gate opens and then set
+        // bootstrap_complete; a percounter lane has nothing to do until it
+        // claims, so nobody would ever set it and this would spin to the
+        // scheduler timeout.
+        if (!is_percounter && !init_failed_.load(std::memory_order_acquire) &&
+            aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         hs_bootstrap_done_.store(true, std::memory_order_release);
@@ -372,6 +388,65 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
+/**
+ * Percounter's supervisor: poll the lanes' batched completion count against the
+ * graph size, with the same progress watchdog the resident supervisor uses.
+ *
+ * Much shorter than its resident counterpart because there is nothing to
+ * correlate: no bootstrap flag to wait for, no per-worker contexts, no traces.
+ * The lanes schedule themselves, so all this thread does is notice when they
+ * have finished, stopped making progress, or reported an error.
+ */
+int32_t AicpuExecutor::percounter_supervise(Runtime *runtime) {
+    auto *control =
+        reinterpret_cast<simpler::hbg::percounter::PercounterControl *>(aicore_percounter_control(runtime));
+    if (control == nullptr || runtime->dev.host_total_tasks < 0) {
+        LOG_ERROR("A5 HBG percounter: supervisor requires an initialized graph");
+        return -1;
+    }
+
+    const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
+    cache_invalidate_range(control, sizeof(*control));
+    const uint64_t expected = control->task_count;
+    uint64_t last_resolved = ~uint64_t{0};
+    uint64_t last_progress_cycles = get_sys_cnt_aicpu();
+    int32_t rc = 0;
+    uint32_t error_poll_count = 0;
+
+    while (true) {
+        cache_invalidate_range(control, sizeof(*control));
+        const uint64_t resolved = control->resolved_task_count;
+        const uint64_t now = get_sys_cnt_aicpu();
+        if (resolved != last_resolved) {
+            last_resolved = resolved;
+            last_progress_cycles = now;
+        }
+        if (resolved >= expected) break;
+        // The lane error is on the same line as the count, so this costs no
+        // extra invalidate -- but reading it every iteration would still be a
+        // branch on the poll path for a value that is almost never set.
+        if (++error_poll_count == 64) {
+            error_poll_count = 0;
+            if (control->lane_error != 0) {
+                LOG_ERROR("A5 HBG percounter: lane reported error %" PRIu64, control->lane_error);
+                rc = -1;
+                break;
+            }
+        }
+        if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
+            record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
+            LOG_ERROR(
+                "A5 HBG percounter: no progress; %" PRIu64 " of %" PRIu64 " tasks resolved", resolved, expected
+            );
+            rc = -1;
+            break;
+        }
+    }
+
+    shutdown_ready_.store(true, std::memory_order_release);
+    return rc;
+}
+
 int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
@@ -383,6 +458,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     bool shutdown_wait_timed_out = false;
+    if (thread_idx == aicpu_thread_num_ - 1 && aicore_scheduler_percounter_enabled(runtime)) {
+        return percounter_supervise(runtime);
+    }
     if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);

@@ -47,10 +47,17 @@ has no scheduler role: every lane pulls its own work.
       there, loudly, with the teardown legacy already owns.
       *File*: `aicpu/aicore_scheduler_state.h`
 
-- [ ] **3. AICPU bring-up** — a percounter branch that reuses the resident
+- [x] **3. AICPU bring-up** — a percounter branch that reuses the resident
       lifecycle for discovery, hand-off, gate and shutdown, and writes the two
       topology numbers where `post_handshake_init` would have written contexts.
       *Files*: `aicpu/aicpu_executor.cpp`, `aicpu/aicore_lifecycle.cpp`
+      Branches at three points inside the shared `init`, rather than forking it:
+      configuration, hand-off, and skipping the bootstrap barrier. Adds
+      `percounter_supervise`, which the resident supervisor cannot serve because
+      it reads a `SchedulerWorkerContext`. The wire structs moved to
+      `runtime/scheduler/percounter_types.h`: the AICPU needs them and
+      `host/percounter_plan.h` reads the environment, which has no business in a
+      header the device target compiles.
 
 - [ ] **4. AICore entry branch** — dispatch to `run_percounter_executor` on
       `SCHEDULER_RUNTIME_MODE_PERCOUNTER`; today anything that is not one of the

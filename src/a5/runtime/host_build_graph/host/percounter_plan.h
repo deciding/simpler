@@ -33,6 +33,7 @@
 #include <cstring>
 #include <type_traits>
 
+#include "scheduler/percounter_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
@@ -123,74 +124,6 @@ inline bool mode_request_is_forced(ModeRequest request)
 {
     return request != ModeRequest::AUTO;
 }
-
-// =========================================================================
-// GM tables
-// =========================================================================
-
-inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
-inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
-
-/**
- * One counter per 64 B cache line.
- *
- * Not a tuning choice. The atomic unit serialises per line rather than per
- * address, so N counters sharing a line cost N times the latency: measured at
- * 6371 cyc for 16 per line against 446 for one. Packing stays *correct* -- no
- * update is lost -- which is why this needs saying. See
- * docs/percounter-scheduler.md §4.
- */
-struct alignas(64) PercounterCounter {
-    uint32_t value;
-    uint8_t reserved[60];
-};
-static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
-static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
-
-/**
- * One ticket per (core type, cluster). Also line-isolated: two tickets sharing
- * a line would serialise two clusters against each other for the same reason
- * the counters do.
- */
-struct alignas(64) PercounterTicket {
-    uint32_t next;
-    uint8_t reserved[60];
-};
-static_assert(sizeof(PercounterTicket) == 64, "a ticket owns exactly one cache line");
-
-/** Where a task's producers live in the flat fanin-address array. */
-struct PercounterFanin {
-    int32_t count;
-    int32_t begin;
-};
-static_assert(sizeof(PercounterFanin) == 8, "percounter fanin record is a wire struct");
-static_assert(std::is_trivially_copyable_v<PercounterFanin> && std::is_standard_layout_v<PercounterFanin>);
-
-/**
- * The device-visible header: where every other segment is, and how long the two
- * order lists are. Offsets are from the percounter region's base, never
- * pointers, so the whole region survives one memcpy to the device.
- */
-struct alignas(128) PercounterControl {
-    uint64_t task_count;
-    uint64_t edge_count;
-    uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT];
-    uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
-    uint64_t tickets_offset;
-    uint64_t fanin_offset;
-    uint64_t fanin_addr_offset;
-    uint64_t counters_offset;
-    // Written by the AICPU after the handshake, not by the host: the cluster
-    // count is discovered at bring-up. Two numbers are the whole of what a lane
-    // needs to place itself, because scheduler_cluster_coordinate_from_worker is
-    // a pure function of them plus the block index it already has. That is why
-    // percounter needs no per-worker context array and no scheduler election.
-    uint64_t cluster_count;
-    uint64_t aiv_per_cluster;
-    uint8_t reserved[128 - 12 * sizeof(uint64_t)];
-};
-static_assert(sizeof(PercounterControl) == 128, "percounter control is one 128 B line");
-static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
 /** Host-side plan. Mirrors AicoreSchedulerLayout's role for the resident mode. */
 struct PercounterLayout {
