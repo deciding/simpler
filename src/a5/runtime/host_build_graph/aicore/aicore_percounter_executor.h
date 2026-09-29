@@ -243,23 +243,27 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             break;
         }
 
-        // Reserved before the fanin wait, so the slot is this task's for the
-        // whole of it. `receive_time` is the claim rather than a dispatch,
-        // because nothing dispatches to a percounter lane -- which makes
-        // `receive_to_start_cycles` the fanin wait plus materialization, i.e.
-        // exactly the scheduling stall the critical-path tool wants to
-        // attribute.
+        // The slot is reserved before the fanin wait so it is this task's for
+        // the whole of it, but the timestamps are not taken here.
         __gm__ ChipSwimlaneAicoreTaskRecord *swimlane_record = nullptr;
-        uint64_t receive_time = 0;
         if (cfg.swimlane_head != nullptr) {
             swimlane_record = chip_swimlane_aicore_reserve_task_record(cfg.swimlane_head, &swimlane_local);
-            receive_time = get_sys_cnt_aicore();
         }
 
         bool aborted = false;
         if (!percounter_wait_for_fanin(cfg, task_id, timeout_cycles, &aborted)) break;
 
-        const uint64_t start_time = cfg.swimlane_head != nullptr ? get_sys_cnt_aicore() : 0;
+        // `receive_time` is taken *after* the fanin wait, and the ordering the
+        // swimlane shows depends on it. Every other mode means "the AICPU has
+        // decided this task is runnable and handed it to you", so the drawn bar
+        // can never precede a producer; the converter starts the bar at this
+        // timestamp, not at `start_time`. Taking it at the claim instead -- the
+        // obvious analogue, since nothing dispatches to a percounter lane --
+        // folds the whole dependency wait into the bar and draws a consumer as
+        // beginning before its producers finished. The wait belongs in the gap
+        // between bars on the lane, which is what it actually is.
+        const uint64_t receive_time = cfg.swimlane_head != nullptr ? get_sys_cnt_aicore() : 0;
+        const uint64_t start_time = receive_time;
         if (!percounter_run_task(cfg, task_id)) {
             scheduler_gm_compare_exchange(
                 cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE)

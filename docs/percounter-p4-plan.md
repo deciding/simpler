@@ -418,6 +418,14 @@ Two consequences worth knowing:
   more than 1024 tasks would silently lose the overflow, because
   `chip_swimlane_aicore_reserve_task_record` returns null past the end rather
   than rotating.
+- **The wait is a gap, not part of the bar.** `receive_time` is taken after the
+  fanin wait, because the converter starts a task's drawn bar at that timestamp
+  rather than at `start_time`. Taking it at the claim -- the obvious analogue,
+  since nothing dispatches to a percounter lane -- folds the whole dependency
+  wait into the bar and draws every consumer as beginning before its producers
+  finished. Measured: 992 of 992 consumers drawn early, against 0 of 992 once
+  the timestamp moved. The raw records were correct throughout; only the
+  timeline lied.
 - **It gives P7 for free.** The 1024 records carry 1024 *distinct* task ids, so
   the trace proves each task ran exactly once — which is precisely the duplicate
   execution the golden comparison cannot see, since its write is idempotent.
