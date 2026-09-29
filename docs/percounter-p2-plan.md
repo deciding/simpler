@@ -70,6 +70,11 @@ has no scheduler role: every lane pulls its own work.
       count. Every spin bounded and checked against EXIT and `scheduler_error`.
       *File*: new `aicore/aicore_percounter_executor.cpp`
 
+- [x] **5b. Unit tests for the loop.s pure logic** — the strided claim and the
+      v0 core-type envelope, extracted so they can be tested at all. 33 cases.
+      They do not execute the loop; they pin the two properties whose failure
+      mode is a hang rather than a wrong answer.
+
 - [ ] **6. Sim scene tests** — BLOCKED on this box: a5sim kernel compilation
       needs g++-15 and a5x8 has g++-12, so no scene test can run here. The
       runtime itself builds (HOST, AICPU and AICore targets all compile).

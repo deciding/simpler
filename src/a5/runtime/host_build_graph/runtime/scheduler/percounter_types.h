@@ -130,4 +130,41 @@ static_assert(sizeof(PercounterControl) == 256, "percounter control is two 128 B
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
 
+/**
+ * Map a lane's `claim`-th ticket draw to a position in its core type's order
+ * list. Returns false once this cluster's share is exhausted.
+ *
+ *     index = cluster_index + claim * cluster_count
+ *
+ * Extracted from the lane loop so it can be tested, because the whole design
+ * rests on two properties of this one line:
+ *
+ *  - **Ascending.** Successive claims give strictly increasing indices, so a
+ *    cluster walks its share in task-id order. That is what makes the scheduler
+ *    deadlock-free: the lowest-id incomplete task is always the next claim of
+ *    whichever cluster owns it, and its producers all have lower ids and are
+ *    therefore already done.
+ *  - **A partition.** Every index below `order_count` belongs to exactly one
+ *    (cluster, claim) pair. A gap would strand a task forever -- a lane
+ *    spinning on a counter nobody will set -- and an overlap would run one
+ *    twice.
+ *
+ * Neither property survives a plausible-looking edit, and neither would show up
+ * as anything but a hang.
+ */
+inline __aicore__ bool percounter_claim_index(
+    uint64_t cluster_index, uint64_t cluster_count, uint64_t claim, uint64_t order_count, uint64_t *index
+)
+{
+    if (index == nullptr || cluster_count == 0 || cluster_index >= cluster_count) return false;
+    // A lane cannot draw enough tickets to wrap this on any real graph, but the
+    // check costs one compare against a hang that would be attributed to the
+    // fanin spin.
+    if (claim > (~uint64_t{0} - cluster_index) / cluster_count) return false;
+    const uint64_t position = cluster_index + claim * cluster_count;
+    if (position >= order_count) return false;
+    *index = position;
+    return true;
+}
+
 }  // namespace simpler::hbg::percounter

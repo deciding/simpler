@@ -133,6 +133,91 @@ TEST(PercounterModeRequest, EmptyEnvironmentValueMeansUnset) {
     EXPECT_EQ(request, ModeRequest::AUTO);
 }
 
+// --- the strided claim ---------------------------------------------------
+
+namespace pcx = simpler::hbg::percounter;
+
+// The property the deadlock argument rests on. If a cluster's claims ever went
+// backwards, a lane could reach a task whose producers are still pending and
+// spin on a counter that will be set only after it -- a hang, with the blame
+// landing on the fanin spin.
+TEST(PercounterClaim, IsStrictlyAscendingWithinACluster) {
+    const uint64_t clusters = 4;
+    const uint64_t order_count = 37;
+    for (uint64_t c = 0; c < clusters; ++c) {
+        uint64_t previous = 0;
+        bool first = true;
+        for (uint64_t k = 0;; ++k) {
+            uint64_t index = 0;
+            if (!pcx::percounter_claim_index(c, clusters, k, order_count, &index)) break;
+            if (!first) EXPECT_GT(index, previous) << "cluster " << c << " claim " << k;
+            previous = index;
+            first = false;
+        }
+    }
+}
+
+// The other property: every task is claimed by exactly one lane. A gap strands
+// a task forever; an overlap runs one twice. Neither shows up as anything but
+// a hang or a wrong result much later.
+TEST(PercounterClaim, PartitionsEveryIndexExactlyOnce) {
+    for (uint64_t clusters : {uint64_t{1}, uint64_t{2}, uint64_t{3}, uint64_t{8}, uint64_t{36}}) {
+        for (uint64_t order_count : {uint64_t{0}, uint64_t{1}, uint64_t{7}, uint64_t{36}, uint64_t{100}}) {
+            std::vector<int> claimed(static_cast<size_t>(order_count), 0);
+            for (uint64_t c = 0; c < clusters; ++c) {
+                for (uint64_t k = 0;; ++k) {
+                    uint64_t index = 0;
+                    if (!pcx::percounter_claim_index(c, clusters, k, order_count, &index)) break;
+                    ASSERT_LT(index, order_count);
+                    ++claimed[static_cast<size_t>(index)];
+                }
+            }
+            for (uint64_t i = 0; i < order_count; ++i) {
+                EXPECT_EQ(claimed[static_cast<size_t>(i)], 1)
+                    << "clusters=" << clusters << " order_count=" << order_count << " index=" << i;
+            }
+        }
+    }
+}
+
+TEST(PercounterClaim, ASingleClusterDegeneratesToSequential) {
+    for (uint64_t k = 0; k < 5; ++k) {
+        uint64_t index = 0;
+        ASSERT_TRUE(pcx::percounter_claim_index(0, 1, k, 5, &index));
+        EXPECT_EQ(index, k);
+    }
+    uint64_t index = 0;
+    EXPECT_FALSE(pcx::percounter_claim_index(0, 1, 5, 5, &index));
+}
+
+TEST(PercounterClaim, RejectsNonsenseRatherThanWrappingIntoSomeoneElsesShare) {
+    uint64_t index = 0;
+    EXPECT_FALSE(pcx::percounter_claim_index(0, 0, 0, 10, &index));   // no clusters
+    EXPECT_FALSE(pcx::percounter_claim_index(4, 4, 0, 10, &index));   // cluster out of range
+    EXPECT_FALSE(pcx::percounter_claim_index(0, 4, 0, 10, nullptr));  // no out param
+    // A claim large enough to overflow must refuse, not alias a low index.
+    EXPECT_FALSE(pcx::percounter_claim_index(1, 4, ~uint64_t{0} / 2, 10, &index));
+}
+
+// --- the v0 core-type envelope -------------------------------------------
+
+// Mirrors resident's scheduler_metadata_single_subtask_slot exactly. Widening
+// it here would let a shape through that the rest of the pipeline rejects, and
+// the two definitions of "a v0 shape" would drift apart.
+TEST(PercounterCoreType, AcceptsOnlyTheTwoSingleSlotShapes) {
+    uint8_t type = 0xFF;
+    ASSERT_TRUE(pcx::core_type_index_from_active_mask(0x1, &type));
+    EXPECT_EQ(type, 0) << "AIC";
+    ASSERT_TRUE(pcx::core_type_index_from_active_mask(0x2, &type));
+    EXPECT_EQ(type, 1) << "AIV0";
+
+    EXPECT_FALSE(pcx::core_type_index_from_active_mask(0x0, &type)) << "empty";
+    EXPECT_FALSE(pcx::core_type_index_from_active_mask(0x4, &type)) << "AIV1 alone";
+    EXPECT_FALSE(pcx::core_type_index_from_active_mask(0x3, &type)) << "MIX";
+    EXPECT_FALSE(pcx::core_type_index_from_active_mask(0x7, &type)) << "all three";
+    EXPECT_FALSE(pcx::core_type_index_from_active_mask(0x1, nullptr));
+}
+
 // --- mode constants ------------------------------------------------------
 
 // 0 is reserved for "nothing selected", and every published mode has to be

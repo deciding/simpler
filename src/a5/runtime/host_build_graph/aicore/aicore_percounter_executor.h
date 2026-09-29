@@ -207,10 +207,11 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         if (scheduler_gm_query(cfg.control->lane_error) != 0) break;
 
         const uint64_t claim = scheduler_gm_fetch_add(cfg.ticket->next, 1);
-        const uint64_t index = cfg.cluster_index + claim * cfg.cluster_count;
-        // This cluster's share is exhausted. Every other index belongs to some
-        // other cluster's stride, so there is nothing here to help with.
-        if (index >= cfg.order_count) break;
+        uint64_t index = 0;
+        // False means this cluster's share is exhausted. Every other index
+        // belongs to some other cluster's stride, so there is nothing left here
+        // to help with.
+        if (!percounter_claim_index(cfg.cluster_index, cfg.cluster_count, claim, cfg.order_count, &index)) break;
 
         const int64_t task_id = cfg.order[index];
         if (task_id < 0 || static_cast<uint64_t>(task_id) >= cfg.graph.task_count) {
