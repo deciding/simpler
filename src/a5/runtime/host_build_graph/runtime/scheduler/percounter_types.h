@@ -129,7 +129,6 @@ struct alignas(128) PercounterControl {
 static_assert(sizeof(PercounterControl) == 256, "percounter control is two 128 B lines");
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
-
 /**
  * Map a lane's `claim`-th ticket draw to a position in its core type's order
  * list. Returns false once this cluster's share is exhausted.
@@ -154,8 +153,7 @@ static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standar
  */
 inline __aicore__ bool percounter_claim_index(
     uint64_t cluster_index, uint64_t cluster_count, uint64_t claim, uint64_t order_count, uint64_t *index
-)
-{
+) {
     if (index == nullptr || cluster_count == 0 || cluster_index >= cluster_count) return false;
     // A lane cannot draw enough tickets to wrap this on any real graph, but the
     // check costs one compare against a hang that would be attributed to the

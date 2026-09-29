@@ -50,8 +50,7 @@ typedef void (*PercounterKernelFunc)(__gm__ int64_t *);
  * so every poll would queue at the atomic unit and cost 169 cyc x consumers.
  * Loads do not queue.
  */
-inline __aicore__ uint64_t percounter_observe(uint64_t counter_address)
-{
+inline __aicore__ uint64_t percounter_observe(uint64_t counter_address) {
     __gm__ uint64_t *word = reinterpret_cast<__gm__ uint64_t *>(counter_address);
     return scheduler_gm_query(*word);
 }
@@ -76,7 +75,7 @@ struct LaneConfig {
     uint32_t callable_count;
     __gm__ DispatchPayload *payload;
     __gm__ PercounterTicket *ticket;
-    __gm__ int32_t *order;
+    __gm__ int64_t *order;
     uint64_t order_count;
     uint64_t cluster_index;
     uint64_t cluster_count;
@@ -94,17 +93,30 @@ struct LaneConfig {
  * Spins rather than sleeping, per .claude/rules/codestyle.md section 5: this is
  * the dispatch path, and a sleep quantum lands on every task that waits.
  */
-inline __aicore__ bool percounter_wait_for_fanin(
-    const LaneConfig &cfg, int64_t task_id, uint64_t timeout_cycles, bool *aborted
-)
-{
-    __gm__ PercounterFanin *fanin = scheduler_state_at<PercounterFanin>(cfg.control, cfg.control->fanin_offset);
-    __gm__ uint64_t *addresses = scheduler_state_at<uint64_t>(cfg.control, cfg.control->fanin_addr_offset);
-    const int32_t count = fanin[task_id].count;
-    const int32_t begin = fanin[task_id].begin;
+inline __aicore__ bool
+percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, uint64_t timeout_cycles, bool *aborted) {
+    __gm__ PercounterFanin *fanin =
+        scheduler_state_at<PercounterFanin>(cfg.control, scheduler_gm_query(cfg.control->fanin_offset));
+    __gm__ uint64_t *addresses =
+        scheduler_state_at<uint64_t>(cfg.control, scheduler_gm_query(cfg.control->fanin_addr_offset));
+    // Device loads, not dereferences. These tables are written by the host and
+    // reach the device by DMA, which does not invalidate this core's scalar
+    // DCache -- so a plain load can return whatever the line held before the
+    // image landed. Measured on silicon: a 64-task chain published 59 counters
+    // and then read an address of 0x120000000000 for the 60th, a value from no
+    // table, because that entry's line had never been refilled. Neighbouring
+    // entries in already-valid lines read correctly, which is why the failure
+    // looks positional rather than systematic.
+    //
+    // Invisible in simulation, where `__gm__` is ordinary process memory and
+    // every load is coherent by construction. The counters were always read
+    // this way (see percounter_observe); the tables were the omission.
+    const uint64_t record = scheduler_gm_query_u32_pair(reinterpret_cast<__gm__ uint32_t *>(&fanin[task_id]));
+    const int32_t count = static_cast<int32_t>(record & 0xffffffffULL);
+    const int32_t begin = static_cast<int32_t>(record >> 32);
 
     for (int32_t i = 0; i < count; ++i) {
-        const uint64_t address = addresses[begin + i];
+        const uint64_t address = scheduler_gm_query(addresses[begin + i]);
         const uint64_t start = get_sys_cnt_aicore();
         uint32_t checks = 0;
         while (percounter_observe(address) == 0) {
@@ -117,8 +129,7 @@ inline __aicore__ bool percounter_wait_for_fanin(
                 }
                 if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
                     scheduler_gm_compare_exchange(
-                        cfg.control->lane_error, uint64_t{0},
-                        static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
+                        cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
                     );
                     *aborted = true;
                     return false;
@@ -138,11 +149,9 @@ inline __aicore__ bool percounter_wait_for_fanin(
  * before the atomic that announces them -- a consumer that observes the counter
  * has observed the data.
  */
-inline __aicore__ bool percounter_run_task(const LaneConfig &cfg, int64_t task_id)
-{
+inline __aicore__ bool percounter_run_task(const LaneConfig &cfg, int64_t task_id) {
     __gm__ uint8_t *descriptor = scheduler_graph_descriptor(cfg.graph, task_id);
-    __gm__ int32_t *kernel_ids =
-        reinterpret_cast<__gm__ int32_t *>(descriptor + SCHEDULER_GRAPH_KERNEL_IDS_OFFSET);
+    __gm__ int32_t *kernel_ids = reinterpret_cast<__gm__ int32_t *>(descriptor + SCHEDULER_GRAPH_KERNEL_IDS_OFFSET);
 
     // v0 admits one active subtask, so exactly one of the three slots is set.
     // The shape check at bind rejected everything else, which is why this can
@@ -196,11 +205,10 @@ inline __aicore__ bool percounter_run_task(const LaneConfig &cfg, int64_t task_i
  * whichever cluster owns it. It is also why the host can build the lists
  * without knowing the topology, which it does not at bind time.
  */
-inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t timeout_cycles)
-{
+inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t timeout_cycles) {
     uint64_t local_done = 0;
     __gm__ PercounterCounter *counters =
-        scheduler_state_at<PercounterCounter>(cfg.control, cfg.control->counters_offset);
+        scheduler_state_at<PercounterCounter>(cfg.control, scheduler_gm_query(cfg.control->counters_offset));
 
     while (true) {
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) break;
@@ -213,11 +221,10 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         // to help with.
         if (!percounter_claim_index(cfg.cluster_index, cfg.cluster_count, claim, cfg.order_count, &index)) break;
 
-        const int64_t task_id = cfg.order[index];
+        const int64_t task_id = static_cast<int64_t>(scheduler_gm_query(cfg.order[index]));
         if (task_id < 0 || static_cast<uint64_t>(task_id) >= cfg.graph.task_count) {
             scheduler_gm_compare_exchange(
-                cfg.control->lane_error, uint64_t{0},
-                static_cast<uint64_t>(SchedulerGraphResult::INVALID_TASK_ID)
+                cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::INVALID_TASK_ID)
             );
             break;
         }
@@ -227,8 +234,7 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
 
         if (!percounter_run_task(cfg, task_id)) {
             scheduler_gm_compare_exchange(
-                cfg.control->lane_error, uint64_t{0},
-                static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE)
+                cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::INVALID_CALLABLE)
             );
             break;
         }
@@ -250,10 +256,7 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
  * whole graph before the gate opens, while a percounter lane has nothing to do
  * until it claims, so it goes straight from READY to the gate to the loop.
  */
-inline __aicore__ void run_percounter_lane(
-    __gm__ PercounterControl *control, int block_idx, CoreType core_type
-)
-{
+inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType core_type) {
     scheduler_observe_data_cache(control);
     const uint64_t timeout_cycles = scheduler_gm_query(control->scheduler_timeout_cycles);
 
@@ -261,8 +264,8 @@ inline __aicore__ void run_percounter_lane(
     const uint32_t type_index = is_aic ? 0U : 1U;
     SchedulerClusterCoordinate coordinate{-1, -1};
     if (!scheduler_cluster_coordinate_from_worker(
-            block_idx, is_aic, static_cast<int32_t>(control->cluster_count),
-            static_cast<int32_t>(control->aiv_per_cluster), &coordinate
+            block_idx, is_aic, static_cast<int32_t>(scheduler_gm_query(control->cluster_count)),
+            static_cast<int32_t>(scheduler_gm_query(control->aiv_per_cluster)), &coordinate
         )) {
         // The AICPU validated the topology before publishing it, so failing here
         // means this lane is not in the topology that was published -- claiming
@@ -275,22 +278,34 @@ inline __aicore__ void run_percounter_lane(
 
     LaneConfig cfg{};
     cfg.control = control;
-    cfg.graph = SchedulerGraphView{control->graph_storage_address, 0, control->task_count, 0};
-    cfg.callable_addresses = reinterpret_cast<__gm__ uint64_t *>(control->callable_addresses_address);
-    cfg.callable_count = static_cast<uint32_t>(control->callable_addresses_count);
+    // Every field here goes through a device load. A plain dereference of this
+    // block is the defect that produced the whole AIC failure: a lane that read
+    // `dispatch_payloads_offset` as 0 placed its DispatchPayload at
+    // `control + block_idx * 512`, which for an AIC block index lands inside the
+    // ticket array, and the first thing payload materialization writes there is
+    // the kernel entry address. That is where the foreign constant in a ticket
+    // came from. AIV block indices are 32..95, so the same miscalculation lands
+    // past the tickets and the failure looked core-type specific.
+    cfg.graph = SchedulerGraphView{
+        scheduler_gm_query(control->graph_storage_address), 0, scheduler_gm_query(control->task_count), 0
+    };
+    cfg.callable_addresses =
+        reinterpret_cast<__gm__ uint64_t *>(scheduler_gm_query(control->callable_addresses_address));
+    cfg.callable_count = static_cast<uint32_t>(scheduler_gm_query(control->callable_addresses_count));
     cfg.payload = scheduler_state_at<DispatchPayload>(
-        control, control->dispatch_payloads_offset + static_cast<uint64_t>(block_idx) * sizeof(DispatchPayload)
+        control, scheduler_gm_query(control->dispatch_payloads_offset) +
+                     static_cast<uint64_t>(block_idx) * sizeof(DispatchPayload)
     );
     cfg.ticket = scheduler_state_at<PercounterTicket>(
-        control, control->tickets_offset +
-                     (static_cast<uint64_t>(type_index) * PERCOUNTER_TICKET_CAPACITY +
-                      static_cast<uint64_t>(coordinate.cluster_index)) *
-                         sizeof(PercounterTicket)
+        control,
+        scheduler_gm_query(control->tickets_offset) + (static_cast<uint64_t>(type_index) * PERCOUNTER_TICKET_CAPACITY +
+                                                       static_cast<uint64_t>(coordinate.cluster_index)) *
+                                                          sizeof(PercounterTicket)
     );
-    cfg.order = scheduler_state_at<int32_t>(control, control->orders_offset[type_index]);
-    cfg.order_count = control->order_count[type_index];
+    cfg.order = scheduler_state_at<int64_t>(control, scheduler_gm_query(control->orders_offset[type_index]));
+    cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
     cfg.cluster_index = static_cast<uint64_t>(coordinate.cluster_index);
-    cfg.cluster_count = control->cluster_count;
+    cfg.cluster_count = scheduler_gm_query(control->cluster_count);
 
     percounter_lane_loop(cfg, timeout_cycles);
 }

@@ -355,8 +355,8 @@ TEST(PercounterTables, PlacesEachTaskInItsCoreTypeListInAscendingOrder) {
     ASSERT_TRUE(pc::build_tables(graph.tasks.data(), 4, layout, region.base(), kDeviceBase, {}, &result))
         << pc::build_status_name(result.status);
 
-    const auto *aic = pc::region_at<int32_t>(region.base(), layout.orders_offset[0]);
-    const auto *aiv = pc::region_at<int32_t>(region.base(), layout.orders_offset[1]);
+    const auto *aic = pc::region_at<int64_t>(region.base(), layout.orders_offset[0]);
+    const auto *aiv = pc::region_at<int64_t>(region.base(), layout.orders_offset[1]);
     EXPECT_EQ(aic[0], 2);
     EXPECT_EQ(aiv[0], 1);
     EXPECT_EQ(aiv[1], 3);

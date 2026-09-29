@@ -277,8 +277,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         }
         completion_gate_.reset();
         if (!init_failed_.load(std::memory_order_acquire)) {
-            const int32_t config_rc = is_percounter ? aicore_lifecycle_.percounter_post_handshake_init(runtime)
-                                                    : aicore_lifecycle_.post_handshake_init(runtime);
+            const int32_t config_rc = is_percounter ? aicore_lifecycle_.percounter_post_handshake_init(runtime) :
+                                                      aicore_lifecycle_.post_handshake_init(runtime);
             if (config_rc != 0) init_failed_.store(true, std::memory_order_release);
         }
         hs_config_done_.store(true, std::memory_order_release);
@@ -397,9 +397,9 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
  * The lanes schedule themselves, so all this thread does is notice when they
  * have finished, stopped making progress, or reported an error.
  */
+
 int32_t AicpuExecutor::percounter_supervise(Runtime *runtime) {
-    auto *control =
-        reinterpret_cast<simpler::hbg::percounter::PercounterControl *>(aicore_percounter_control(runtime));
+    auto *control = reinterpret_cast<simpler::hbg::percounter::PercounterControl *>(aicore_percounter_control(runtime));
     if (control == nullptr || runtime->dev.host_total_tasks < 0) {
         LOG_ERROR("A5 HBG percounter: supervisor requires an initialized graph");
         return -1;
@@ -435,9 +435,7 @@ int32_t AicpuExecutor::percounter_supervise(Runtime *runtime) {
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
             record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
-            LOG_ERROR(
-                "A5 HBG percounter: no progress; %" PRIu64 " of %" PRIu64 " tasks resolved", resolved, expected
-            );
+            LOG_ERROR("A5 HBG percounter: no progress; %" PRIu64 " of %" PRIu64 " tasks resolved", resolved, expected);
             rc = -1;
             break;
         }

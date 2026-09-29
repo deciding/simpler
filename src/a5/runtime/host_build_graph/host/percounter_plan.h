@@ -64,8 +64,7 @@ inline constexpr const char *SIMPLER_HBG_SCHEDULER_ENV = "SIMPLER_HBG_SCHEDULER"
  * nullptr means "not set" and yields AUTO, which is the only way to get the
  * automatic choice.
  */
-inline bool parse_mode_request(const char *text, ModeRequest *out)
-{
+inline bool parse_mode_request(const char *text, ModeRequest *out) {
     if (out == nullptr) return false;
     if (text == nullptr) {
         *out = ModeRequest::AUTO;
@@ -97,21 +96,23 @@ inline bool parse_mode_request(const char *text, ModeRequest *out)
  * An empty value is treated as unset, matching how the repo's other knobs
  * behave when a shell exports a variable with nothing in it.
  */
-inline bool resolve_mode_request(ModeRequest *out)
-{
+inline bool resolve_mode_request(ModeRequest *out) {
     const char *text = std::getenv(SIMPLER_HBG_SCHEDULER_ENV);
     if (text != nullptr && text[0] == '\0') text = nullptr;
     return parse_mode_request(text, out);
 }
 
 /** The spelling a request came from, for log lines and error messages. */
-inline const char *mode_request_name(ModeRequest request)
-{
+inline const char *mode_request_name(ModeRequest request) {
     switch (request) {
-        case ModeRequest::AUTO: return "auto";
-        case ModeRequest::LEGACY: return "legacy";
-        case ModeRequest::RESIDENT: return "resident";
-        case ModeRequest::PERCOUNTER: return "percounter";
+    case ModeRequest::AUTO:
+        return "auto";
+    case ModeRequest::LEGACY:
+        return "legacy";
+    case ModeRequest::RESIDENT:
+        return "resident";
+    case ModeRequest::PERCOUNTER:
+        return "percounter";
     }
     return "?";
 }
@@ -120,10 +121,7 @@ inline const char *mode_request_name(ModeRequest request)
  * Whether a request pins the scheduler. A pinned request that the graph cannot
  * satisfy is a bind failure; only AUTO is allowed to fall back.
  */
-inline bool mode_request_is_forced(ModeRequest request)
-{
-    return request != ModeRequest::AUTO;
-}
+inline bool mode_request_is_forced(ModeRequest request) { return request != ModeRequest::AUTO; }
 
 /** Host-side plan. Mirrors AicoreSchedulerLayout's role for the resident mode. */
 struct PercounterLayout {
@@ -164,8 +162,7 @@ struct ExternalAddresses {
 inline bool plan_layout(
     uint64_t task_count, uint64_t edge_count, const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT],
     PercounterLayout *layout
-)
-{
+) {
     if (layout == nullptr || order_count == nullptr) return false;
     uint64_t placed = 0;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) {
@@ -180,7 +177,8 @@ inline bool plan_layout(
     PercounterLayout next{};
     next.task_count = task_count;
     next.edge_count = edge_count;
-    for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) next.order_count[t] = order_count[t];
+    for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
+        next.order_count[t] = order_count[t];
 
     uint64_t cursor = 0;
     uint64_t bytes = 0;
@@ -195,8 +193,8 @@ inline bool plan_layout(
             static_cast<uint64_t>(PERCOUNTER_CORE_TYPE_COUNT) * PERCOUNTER_TICKET_CAPACITY, PercounterTicket,
             tickets_offset
         ) ||
-        !PERCOUNTER_RESERVE(order_count[0], int32_t, orders_offset[0]) ||
-        !PERCOUNTER_RESERVE(order_count[1], int32_t, orders_offset[1]) ||
+        !PERCOUNTER_RESERVE(order_count[0], int64_t, orders_offset[0]) ||
+        !PERCOUNTER_RESERVE(order_count[1], int64_t, orders_offset[1]) ||
         !PERCOUNTER_RESERVE(task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
@@ -221,8 +219,7 @@ inline bool plan_layout(
  * reaching here. Mirroring it rather than widening it keeps one definition of
  * "a v0 shape" instead of two that can drift.
  */
-inline bool core_type_index_from_active_mask(uint8_t active_mask, uint8_t *out)
-{
+inline bool core_type_index_from_active_mask(uint8_t active_mask, uint8_t *out) {
     if (out == nullptr) return false;
     if (active_mask == 1U) {
         *out = 0;  // AIC
@@ -236,15 +233,14 @@ inline bool core_type_index_from_active_mask(uint8_t active_mask, uint8_t *out)
 }
 
 /** Whether a request pins the run to a scheduler that executes on the device. */
-inline bool mode_request_needs_device_scheduler(ModeRequest request)
-{
+inline bool mode_request_needs_device_scheduler(ModeRequest request) {
     return request == ModeRequest::RESIDENT || request == ModeRequest::PERCOUNTER;
 }
 
 /** One task, as the table builder needs to see it. */
 struct TaskInput {
-    uint8_t core_type_index;   // 0 = AIC, 1 = AIV
-    bool inline_completed;     // already done at bind: counter preset, placed in no list
+    uint8_t core_type_index;  // 0 = AIC, 1 = AIV
+    bool inline_completed;    // already done at bind: counter preset, placed in no list
     int32_t fanin_count;
     const int32_t *fanin_ids;  // producer task ids; may be null when count is 0
 };
@@ -254,22 +250,28 @@ enum class BuildStatus : uint8_t {
     OK = 0,
     INVALID_ARGUMENT,
     BAD_CORE_TYPE,
-    ORDER_COUNT_MISMATCH,   // the plan's list lengths disagree with the tasks
-    EDGE_COUNT_MISMATCH,    // the plan's edge total disagrees with the tasks
+    ORDER_COUNT_MISMATCH,  // the plan's list lengths disagree with the tasks
+    EDGE_COUNT_MISMATCH,   // the plan's edge total disagrees with the tasks
     PRODUCER_NOT_BEFORE_CONSUMER,
     PRODUCER_OUT_OF_RANGE,
 };
 
-inline const char *build_status_name(BuildStatus status)
-{
+inline const char *build_status_name(BuildStatus status) {
     switch (status) {
-        case BuildStatus::OK: return "ok";
-        case BuildStatus::INVALID_ARGUMENT: return "invalid argument";
-        case BuildStatus::BAD_CORE_TYPE: return "core type out of range";
-        case BuildStatus::ORDER_COUNT_MISMATCH: return "order count disagrees with the task list";
-        case BuildStatus::EDGE_COUNT_MISMATCH: return "edge count disagrees with the task list";
-        case BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER: return "a fanin edge does not point backwards";
-        case BuildStatus::PRODUCER_OUT_OF_RANGE: return "a fanin edge names no task";
+    case BuildStatus::OK:
+        return "ok";
+    case BuildStatus::INVALID_ARGUMENT:
+        return "invalid argument";
+    case BuildStatus::BAD_CORE_TYPE:
+        return "core type out of range";
+    case BuildStatus::ORDER_COUNT_MISMATCH:
+        return "order count disagrees with the task list";
+    case BuildStatus::EDGE_COUNT_MISMATCH:
+        return "edge count disagrees with the task list";
+    case BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER:
+        return "a fanin edge does not point backwards";
+    case BuildStatus::PRODUCER_OUT_OF_RANGE:
+        return "a fanin edge names no task";
     }
     return "?";
 }
@@ -282,8 +284,7 @@ struct BuildResult {
 };
 
 template <typename T>
-inline T *region_at(void *base, uint64_t offset)
-{
+inline T *region_at(void *base, uint64_t offset) {
     return reinterpret_cast<T *>(static_cast<uint8_t *>(base) + offset);
 }
 
@@ -305,8 +306,7 @@ inline T *region_at(void *base, uint64_t offset)
 inline bool build_tables(
     const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
     const ExternalAddresses &external = {}, BuildResult *result = nullptr
-)
-{
+) {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
         if (result != nullptr) *result = BuildResult{status, task_id, fanin_index};
         return false;
@@ -321,9 +321,9 @@ inline bool build_tables(
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
     auto *fanin_addr = region_at<uint64_t>(base, layout.fanin_addr_offset);
     auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
-    int32_t *orders[PERCOUNTER_CORE_TYPE_COUNT] = {
-        region_at<int32_t>(base, layout.orders_offset[0]),
-        region_at<int32_t>(base, layout.orders_offset[1]),
+    int64_t *orders[PERCOUNTER_CORE_TYPE_COUNT] = {
+        region_at<int64_t>(base, layout.orders_offset[0]),
+        region_at<int64_t>(base, layout.orders_offset[1]),
     };
 
     uint64_t placed[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
@@ -363,7 +363,7 @@ inline bool build_tables(
         // Appending in id order is what keeps each list ascending, which is what
         // makes any strided slice of it ascending, which is what makes the
         // device's per-cluster claim deadlock-free.
-        orders[type][placed[type]] = static_cast<int32_t>(id);
+        orders[type][placed[type]] = static_cast<int64_t>(id);
         ++placed[type];
     }
 
