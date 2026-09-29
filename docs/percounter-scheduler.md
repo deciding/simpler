@@ -295,6 +295,32 @@ An unknown value is rejected rather than ignored: a misspelled environment
 variable that silently does nothing is the failure mode
 [`env-macro-gating.md`](../.claude/rules/env-macro-gating.md) exists to prevent.
 
+### A forced request cannot silently downgrade
+
+This is what makes a passing run under `SIMPLER_HBG_SCHEDULER=percounter`
+evidence that percounter ran — not a log line, which a silent fallback would
+leave looking identical. `create_scheduler_state` has exactly three places that
+select some other scheduler and return success, and under a forced device
+request none of them is reachable:
+
+| site | mode published | reachable when forced to percounter? |
+| --- | --- | --- |
+| the `mode_request == LEGACY` branch | `LEGACY_REQUESTED` | no — the branch tests the request |
+| a `TaskKind::GRAPH` task | `LEGACY_GRAPH` | no — `mode_request_needs_device_scheduler` returns false first |
+| a MIX / SPMD / sync-start shape | `LEGACY_UNSUPPORTED_SHAPE` | no — same guard |
+
+Every other exit before the tail is `return false`, and the tail is
+`if (mode_request == PERCOUNTER) return create_percounter_state(...)`. So a
+forced percounter request has two outcomes and no third: percounter is
+published, or the bind fails loudly. `graph_execution` is the live
+demonstration — under `auto` it passes on legacy, under `percounter` it refuses
+with `cannot run a graph-execution task (id=1)`.
+
+The invariant is held by those two guards being present, which nothing checks
+mechanically. A fourth selection site added without one would reintroduce the
+silent downgrade, and every percounter measurement taken afterwards would be a
+measurement of resident.
+
 New constants in `scheduler_layout.h`: `SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5`
 and `SCHEDULER_RUNTIME_MODE_LEGACY_REQUESTED = 6` (so an explicit legacy choice
 is distinguishable from a forced fallback in logs and terminal records). The
@@ -328,7 +354,7 @@ percounter does not call it, so that check is not in the way.
 | **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `ld_dev` wins at ~98 cyc, ticket shards per cluster |
 | **P1** | ~~host: env parsing, constants, layout, table build~~ | **done** — [`percounter-p1-plan.md`](percounter-p1-plan.md); 26 new cases, 264/264 ut-cpp passing |
 | **P2** | ~~AICPU predicate, AICore branch, `run_percounter_executor`~~ | **done** — [`percounter-p2-plan.md`](percounter-p2-plan.md); percounter executes on a5sim and passes every scene test the other two modes pass, 264/264 ut-cpp |
-| **P3** | a scene test built for percounter, and an assertion that it ran | a new wide/deep mixed AIC+AIV DAG — the existing tests are chains, which exercise the fanin spin but never the strided claim under contention — plus a programmatic check of the selected mode, so no result rests on reading a log |
+| **P3** | ~~the shapes that stress the claim, and what "it ran" rests on~~ | **done** — [`percounter-p3-plan.md`](percounter-p3-plan.md); `multi_core_dag`'s wide, random and 4096-task zero-edge cases pass under all three modes. No new test was needed: those cases already existed behind `manual: True`. The mode assertion is structural, not observational — see §5 |
 | **P4** | onboard | `onboard-arch-precheck`, then `task-submit`; device Total and chip swimlane across the three modes |
 | **P5** | docs | a percounter section in `RUNTIME_LOGIC.md`; register the env var; grep for stale references per [`doc-consistency.md`](../.claude/rules/doc-consistency.md) |
 
