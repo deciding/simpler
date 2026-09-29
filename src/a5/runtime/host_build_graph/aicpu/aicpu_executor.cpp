@@ -443,7 +443,6 @@ int32_t AicpuExecutor::percounter_supervise(Runtime *runtime) {
         }
     }
 
-    shutdown_ready_.store(true, std::memory_order_release);
     return rc;
 }
 
@@ -458,10 +457,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     bool shutdown_wait_timed_out = false;
-    if (thread_idx == aicpu_thread_num_ - 1 && aicore_scheduler_percounter_enabled(runtime)) {
-        return percounter_supervise(runtime);
-    }
-    if (thread_idx == aicpu_thread_num_ - 1) {
+    const bool percounter = aicore_scheduler_percounter_enabled(runtime);
+    if (thread_idx == aicpu_thread_num_ - 1 && percounter) {
+        // Only the completion wait differs; everything below the supervisor
+        // block -- shutdown_ready_, the signalled-partition count, the terminal
+        // record and the completion gate -- is the same teardown every mode
+        // owes its peers. Returning from here instead would leave
+        // shutdown_signaled_ one short of aicpu_thread_num_ forever, and the
+        // peers would blame AICPU_SHUTDOWN_BARRIER_TIMEOUT on the graph.
+        run_status_.store(percounter_supervise(runtime), std::memory_order_release);
+        shutdown_ready_.store(true, std::memory_order_release);
+    } else if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
         if (context == nullptr || runtime->dev.host_total_tasks < 0) {

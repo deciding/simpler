@@ -327,8 +327,8 @@ percounter does not call it, so that check is not in the way.
 | **P0** | ~~stride sweep, fanin spin cost, ticket crossover~~ | **done** — `a5_test/ascendc/counter_deps/`, results in §4 |
 | **P0b** | ~~read idiom, realistic consumer counts, ticket sharding~~ | **done** — §4: `ld_dev` wins at ~98 cyc, ticket shards per cluster |
 | **P1** | ~~host: env parsing, constants, layout, table build~~ | **done** — [`percounter-p1-plan.md`](percounter-p1-plan.md); 26 new cases, 264/264 ut-cpp passing |
-| **P2** | AICPU predicate, AICore branch, `run_percounter_executor` | builds; a5sim |
-| **P3** | sim scene tests | `vector_example`, `single_core_dag`, `multi_core_dag`, `empty_lifecycle` across all three modes, plus a new wide/deep mixed AIC+AIV DAG and an assertion that percounter really ran |
+| **P2** | ~~AICPU predicate, AICore branch, `run_percounter_executor`~~ | **done** — [`percounter-p2-plan.md`](percounter-p2-plan.md); percounter executes on a5sim and passes every scene test the other two modes pass, 264/264 ut-cpp |
+| **P3** | a scene test built for percounter, and an assertion that it ran | a new wide/deep mixed AIC+AIV DAG — the existing tests are chains, which exercise the fanin spin but never the strided claim under contention — plus a programmatic check of the selected mode, so no result rests on reading a log |
 | **P4** | onboard | `onboard-arch-precheck`, then `task-submit`; device Total and chip swimlane across the three modes |
 | **P5** | docs | a percounter section in `RUNTIME_LOGIC.md`; register the env var; grep for stale references per [`doc-consistency.md`](../.claude/rules/doc-consistency.md) |
 

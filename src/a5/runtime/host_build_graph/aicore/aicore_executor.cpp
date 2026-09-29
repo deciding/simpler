@@ -94,6 +94,28 @@ __aicore__ void run_percounter_executor(
     // override, so it is readable before READY -- which the first wait needs.
     const uint64_t timeout_cycles = scheduler_gm_query(control->scheduler_timeout_cycles);
 
+    // The report the AICPU's handshake counts. A percounter lane needs no
+    // per-worker context, but it is still a core the AICPU has to discover: the
+    // reply below is published only to workers whose `reg_addr` this report
+    // filled in. Zero is the pending value, because the lane waits for exactly
+    // SCHEDULER_RUNTIME_MODE_PERCOUNTER, so clearing to zero also retires a
+    // predecessor run's reply.
+    const uint64_t report_epoch = get_aicore_report_epoch();
+    if (report_epoch != 0) {
+        aicore_stage_native_report(
+            handshake, get_physical_core_id(), core_type, static_cast<uint32_t>(block_idx) + 1, 0
+        );
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->report_epoch = report_epoch;
+    } else {
+        handshake->physical_core_id = get_physical_core_id();
+        handshake->core_type = core_type;
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->aicore_done = block_idx + 1;
+    }
+    dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+
     // The AICPU publishes READY once it has written the topology into the
     // control block. Without that wait a lane would read a cluster count of
     // zero and place itself nowhere.

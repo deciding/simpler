@@ -75,13 +75,61 @@ has no scheduler role: every lane pulls its own work.
       They do not execute the loop; they pin the two properties whose failure
       mode is a hang rather than a wrong answer.
 
-- [ ] **6. Sim scene tests** — BLOCKED on this box: a5sim kernel compilation
-      needs g++-15 and a5x8 has g++-12, so no scene test can run here. The
-      runtime itself builds (HOST, AICPU and AICore targets all compile).
-      Original scope: — `vector_example`, `single_core_dag`,
-      `multi_core_dag`, `empty_lifecycle` under all three modes, plus an
-      assertion that percounter actually ran.
-      *Files*: `tests/st/a5/host_build_graph/…`
+- [x] **6. Sim scene tests** — percounter executes, and passes everything the
+      other two modes pass. The host log confirms the mode rather than the pass
+      doing so (`A5 HBG: selected percounter for 64 tasks (64 AIC, 0 AIV, 63
+      edges)`, `topology 8 clusters x 2 AIV`), so a silent fallback could not
+      have produced these results.
+
+      | test | legacy | resident | percounter |
+      | --- | --- | --- | --- |
+      | `single_core_dag` | pass | pass | pass |
+      | `multi_core_dag` | pass | pass | pass |
+      | `single_root` (3) | pass | pass | pass |
+      | `vector_example` | pass | pass | pass |
+      | `empty_lifecycle` | **hangs** | pass | pass |
+      | `graph_execution` (3) | pass | refused | refused |
+
+      Two cells are not percounter's, and both were mislabelled before being
+      read: `vector_example` and `graph_execution` are `manual: ["a5sim"]`, so
+      they need `--manual include` or nothing is collected at all.
+
+      - **`graph_execution` refused** under both device modes is the designed
+        contract, not a failure: `A5 HBG: SIMPLER_HBG_SCHEDULER=percounter
+        cannot run a graph-execution task (id=1)`. Only AUTO may fall back
+        silently, and AUTO passes all three cases.
+      - **`empty_lifecycle` hangs under forced legacy** — a pre-existing legacy
+        defect this knob is simply the first thing to reach; AUTO sends an empty
+        graph to resident. Logged in `KNOWN_ISSUES.md`; see step 6a.
+
+      The g++-15 blocker is gone: `gxx_linux-64=15.3.0` from conda-forge into a
+      home prefix, shimmed to the bare names `simpler_setup` looks for. No root,
+      and nothing outside the user's home.
+
+      Two bugs only a real run could have found, both in the bring-up
+      protocol rather than the scheduling:
+
+      - **The lane never reported its handshake.** It waited for `aicpu_ready`
+        while `handshake_partition` waited for the report that wait was supposed
+        to follow. Percounter needs no per-worker context, which is what made it
+        look as though it needed no report either — but the AICPU publishes its
+        reply only to workers a report gave it a `reg_addr` for.
+      - **The supervisor returned straight out of `run()`**, skipping the
+        teardown every mode owes its peers, so `shutdown_signaled_` stayed one
+        short forever and four threads blamed `AICPU_SHUTDOWN_BARRIER_TIMEOUT`
+        on a graph that had in fact completed.
+
+      *Files*: `aicore/aicore_executor.cpp`, `aicpu/aicpu_executor.cpp`
+
+      **Neither is ours to fix, and neither is re-run.** The two cells are
+      excluded from the percounter matrix rather than worked around: the refusal
+      is the contract behaving correctly, and the hang is legacy's termination
+      logic. The hang is recorded in `KNOWN_ISSUES.md` — with `total_tasks_ ==
+      0` the P thread can neither complete (`completed_` is published only from
+      a completion event, and an empty graph produces none) nor time out (the
+      stall latch is guarded by `total > 0`, so "no tasks" reads as "nothing
+      outstanding, not a stall"), leaving no exit. Percounter runs
+      `empty_lifecycle` correctly, so nothing here blocks it.
 
 - [x] **7. Build a5sim** — no card. `build_runtimes --platforms a5sim` compiles
       all three targets, which is the only build that touches the a5 AICore and
