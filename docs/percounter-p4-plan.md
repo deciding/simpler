@@ -244,18 +244,88 @@ Simulation can confirm neither, since neither has any effect there.
       permanent 7 KB of region, and [`env-macro-gating.md`](../.claude/rules/env-macro-gating.md)
       §1 prefers no gate to a gate. What they established is recorded here.
 
-- [ ] **2. Scene tests onboard, all three modes.** The P2/P3 set on real
+- [x] **2. Scene tests onboard, all three modes.** All green on silicon, and
+      the ordering is checked on the device rather than inferred: each kernel
+      invalidates and re-reads every producer's slot before running, writing a
+      negative marker if any producer has not published, and `compute_golden`
+      requires every slot to hold exactly `task_id + 1`. A task that ran early
+      fails the comparison, and one that never ran leaves a zero. **Duplicate
+      execution is not covered** — the write is idempotent, so a claim-partition
+      overlap would pass silently; that gap is P7.
+
+      | case | tasks | percounter | resident | legacy |
+      | --- | --- | --- | --- | --- |
+      | `single_core_dag` (3 cases × 6) | 64 / 25 | 18/18 | — | — |
+      | `mixed_chain_65` | 65 | pass | pass | pass |
+      | `mixed_chain_1024` | 1024 | pass | pass | pass |
+      | `mixed_fanin32_1024` | 1024 | pass | pass | pass |
+      | `mixed_random_1024` | 1024 | pass | pass | pass |
+      | `mixed_multi_root_4096` | 4096 | pass | pass | pass |
+
+      Excluded as in P3 and for the same reasons: `graph_execution` under a
+      forced device mode (refused by contract) and `empty_lifecycle` under
+      legacy (not ours). The P2/P3 set on real
       silicon: `single_core_dag`, `multi_core_dag` (including the manual
       contention cases), `single_root`, `vector_example`. Excluded as in P3 and
       for the same reasons: `graph_execution` under a forced device mode
       (refused by contract) and `empty_lifecycle` under legacy (not ours).
 
-- [ ] **3. Timing.** Device Total and the chip swimlane across the three modes,
-      on the shapes where they differ: the 4096-task zero-edge case is the one
-      percounter should win, since it is pure claim throughput with no
-      dependency resolution for resident's scheduler to do.
+- [x] **3. Timing.** The remaining work in P4; step 4 was a placeholder for
+      follow-up defects and step 1a consumed it.
 
-- [ ] **4. Whatever steps 2–3 find.**
+      Device wall (`chip.run.runner_run.device_wall`) from the run's own
+      `[STRACE]` markers, `--rounds 5`, **round 0 dropped as warm-up** (it runs
+      3–50× the steady value), two independent submissions. The two samples
+      agree within 2% on every point, so the spread is not worth tabulating:
+
+      | case | percounter | resident | legacy | vs resident |
+      | --- | --- | --- | --- | --- |
+      | `mixed_multi_root_4096` | **518 µs** | 655 | 3725 | 1.26× |
+      | `mixed_chain_1024` | **2657 µs** | 6461 | 5763 | 2.43× |
+      | `mixed_fanin32_1024` | **288 µs** | 7837 | 1167 | 27× |
+      | `mixed_random_1024` | **217 µs** | 830 | 1438 | 3.8× |
+
+      Percounter is ahead on every shape, and the ordering of the margins is the
+      part that reads as evidence rather than luck. The 4096-task zero-edge case
+      is the *narrowest* win (1.26×) because there is no dependency work for
+      anyone to do — it measures claim throughput alone, and percounter's
+      advantage there is only that a ticket draw is cheaper than a wake-list
+      dispatch. The widest is `fanin32`, where 992 tasks each wait on all 32
+      roots: percounter reads 32 counters and proceeds, while resident has to
+      register and walk ~31,700 wake-list edges. That is exactly the asymmetry
+      the design predicted, and it appears in the right place.
+
+      Wall-clock from the scene test says none of this — all three modes finish
+      in 12–14 s, which is process start-up and kernel compilation.
+
+      Two things worth recording that are not percounter's:
+
+      - **Legacy beats resident on wide fanin** (1167 µs against 7837) and
+        slightly on the long chain. Resident's cost on `fanin32` is out of line
+        with its cost everywhere else.
+      - The comparison is not like-for-like in capability: percounter v0 refuses
+        MIX, SPMD and sync-start shapes that resident runs, so these numbers are
+        for the subset percounter supports.
+
+      Wall-clock from the scene test is not the measurement — all three modes
+      came in at 12–14 s on the big graphs, which is process start-up and
+      compilation, not scheduling. The comparison has to be device-side:
+
+      - **What to compare**: the `chip.run` span and its device portion from the
+        `[STRACE]` markers, parsed with
+        `python -m simpler_setup.tools.strace_timing <log> --rounds-table`.
+      - **On which shapes**: `mixed_multi_root_4096` first — 4096 independent
+        tasks is pure claim throughput, with no dependency resolution for
+        resident's scheduler to do, so it is where percounter should win if it
+        wins anywhere. `mixed_chain_1024` is the opposite bound: fully serial,
+        so it should measure the per-edge latency of the fanin spin against
+        resident's wake list. `mixed_fanin32_1024` sits between them and is the
+        one that stresses 32 `ld_dev` reads per task.
+      - **Against what**: resident is the baseline that matters; legacy is
+        included only to show the floor.
+      - **Repeats**: a single run is not a number. Several per point, and the
+        spread reported, on a shared card where another user's job changes
+        memory pressure.
 
 ## Card discipline
 

@@ -148,6 +148,12 @@ P0 measured the three properties this design rests on, on one card with 96 cores
 `a5_test/docs/counter-deps-analysis.md`. Background figures come from the
 earlier `atomic_latency` and `gm_lat` probes in the same repo.
 
+**Every figure below was taken on AIV.** `counter_deps` launches vector
+kernels, so none of it has been reproduced on a cube core — and percounter puts
+a claim loop on AIC, which nothing in this runtime had done before. The numbers
+are still the basis for the design's choices, but they are verified on one of
+the two core types the design uses. Re-taking them on AIC is P6.
+
 | Quantity | Value |
 | --- | --- |
 | Empty-loop floor | 19.8 cyc |
@@ -355,8 +361,10 @@ percounter does not call it, so that check is not in the way.
 | **P1** | ~~host: env parsing, constants, layout, table build~~ | **done** — [`percounter-p1-plan.md`](percounter-p1-plan.md); 26 new cases, 264/264 ut-cpp passing |
 | **P2** | ~~AICPU predicate, AICore branch, `run_percounter_executor`~~ | **done** — [`percounter-p2-plan.md`](percounter-p2-plan.md); percounter executes on a5sim and passes every scene test the other two modes pass, 264/264 ut-cpp |
 | **P3** | ~~the shapes that stress the claim, and what "it ran" rests on~~ | **done** — [`percounter-p3-plan.md`](percounter-p3-plan.md); `multi_core_dag`'s wide, random and 4096-task zero-edge cases pass under all three modes. No new test was needed: those cases already existed behind `manual: True`. The mode assertion is structural, not observational — see §5 |
-| **P4** | onboard | `onboard-arch-precheck`, then `task-submit`; device Total and chip swimlane across the three modes |
+| **P4** | ~~onboard~~ | **done** — [`percounter-p4-plan.md`](percounter-p4-plan.md); one real defect found and fixed, all scene tests green on silicon, and percounter ahead of resident on every measured shape (1.26× to 27×) |
 | **P5** | docs | a percounter section in `RUNTIME_LOGIC.md`; register the env var; grep for stale references per [`doc-consistency.md`](../.claude/rules/doc-consistency.md) |
+| **P6** | **re-measure P0 on AIC** | every number in §4 was taken on **AIV** — `counter_deps` launches vector kernels — but half of percounter's lanes are AIC. The read-idiom comparison, the ticket crossover and the line-sharing cost are all cited here as load-bearing and are currently verified on one core type out of two. Add a cube variant to `a5_test/ascendc/counter_deps/` and re-take the tables |
+| **P7** | **detect duplicate execution** | the scene-test kernels verify ordering and completeness but not uniqueness: a task claimed twice writes `task_id + 1` both times, so a claim-partition overlap passes the golden comparison silently. `percounter_claim_index`'s partition property is unit-tested by construction, but nothing on-device would catch a live overlap |
 
 Hardware runs follow `a5_test`: explicit `--device 0|1|2|3` (never `auto`),
 always through `task-submit`, and sized to finish in minutes.
